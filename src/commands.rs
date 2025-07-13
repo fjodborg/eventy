@@ -7,7 +7,11 @@ use crate::{messages::{error_message, success_message, verification_message}, Co
 #[poise::command(prefix_command, slash_command)]
 pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
     info!("Ping command called by {}", ctx.author().name);
-    ctx.say("🏓 Pong! Bot is working!").await?;
+    ctx.send(poise::CreateReply::default()
+        .content("🏓 Pong! Bot is working!")
+        .ephemeral(true))
+        .await?;
+
     Ok(())
 }
 
