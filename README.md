@@ -186,3 +186,4 @@ Use the `/ping` command to verify bot connectivity and responsiveness.
 - [ ] Add event planning.
 - [ ] Add log output for admin users.
 - [ ] Add configuration messages to setup welcome messages, validation formats, roles, users access etc.
+- [ ] Create file/command for configuring channels that should exist and under which category.
