@@ -1,0 +1,103 @@
+[
+    {
+        "role": "unverified",
+        "channels": [
+            {
+                "name": "welcome",
+                "permission": "Read"
+            },
+            {
+                "name": "rules",
+                "permission": "Read"
+            }
+        ],
+        "permissions": {
+            "view_channel": true,
+            "read_message_history": true
+        },
+        "color": "grey",
+        "mentionable": false,
+        "hoist": false,
+        "position": 1
+    },
+    {
+        "role": "member",
+        "category": "2025E",
+        "channels": [
+            {
+                "name": "announcement",
+                "permission": "Read"
+            },
+            {
+                "name": "general",
+                "permission": "ReadWrite"
+            },
+            {
+                "name": "events",
+                "permission": "ReadWrite"
+            }
+        ],
+        "permissions": {
+            "view_channel": true,
+            "send_messages": true,
+            "read_message_history": true,
+            "add_reactions": true,
+            "use_external_emojis": true,
+            "embed_links": true,
+            "attach_files": true,
+            "connect": true,
+            "speak": true
+        },
+        "color": "#3498db",
+        "mentionable": true,
+        "hoist": false,
+        "position": 2
+    },
+    {
+        "role": "moderator",
+        "category": "2025E",
+        "channels": [
+            {
+                "name": "announcement",
+                "permission": "ReadWrite"
+            },
+            {
+                "name": "general",
+                "permission": "ReadWrite"
+            },
+            {
+                "name": "events",
+                "permission": "ReadWrite"
+            }
+        ],
+        "permissions": {
+            "view_channel": true,
+            "send_messages": true,
+            "read_message_history": true,
+            "manage_messages": true,
+            "add_reactions": true,
+            "use_external_emojis": true,
+            "embed_links": true,
+            "attach_files": true,
+            "connect": true,
+            "speak": true,
+            "mute_members": true,
+            "move_members": true
+        },
+        "color": "orange",
+        "mentionable": true,
+        "hoist": true,
+        "position": 3
+    },
+    {
+        "role": "admin",
+        "channels": [],
+        "permissions": {
+            "administrator": true
+        },
+        "color": "#e74c3c",
+        "mentionable": true,
+        "hoist": true,
+        "position": 4
+    }
+]
