@@ -1,0 +1,68 @@
+[
+    {
+        "role": "unverified",
+        "category": "",
+        "channels": [
+            {
+                "name": "welcome",
+                "permission": "Read"
+            },
+            {
+                "name": "rules",
+                "permission": "Read"
+            }
+        ]
+    },
+    {
+        "role": "member",
+        "category": "2025E",
+        "channels": [
+            {
+                "name": "welcome",
+                "permission": "None"
+            },
+            {
+                "name": "rules",
+                "permission": "None"
+            },
+            {
+                "name": "announcement",
+                "permission": "Read"
+            },
+            {
+                "name": "general",
+                "permission": "ReadWrite"
+            },
+            {
+                "name": "events",
+                "permission": "Read"
+            }
+        ]
+    },
+    {
+        "role": "moderator",
+        "category": "2025E",
+        "channels": [
+            {
+                "name": "welcome",
+                "permission": "None"
+            },
+            {
+                "name": "rules",
+                "permission": "None"
+            },
+            {
+                "name": "announcement",
+                "permission": "ReadWrite"
+            },
+            {
+                "name": "general",
+                "permission": "ReadWrite"
+            },
+            {
+                "name": "events",
+                "permission": "ReadWrite"
+            }
+        ]
+    }
+]

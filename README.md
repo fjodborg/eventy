@@ -187,3 +187,11 @@ Use the `/ping` command to verify bot connectivity and responsiveness.
 - [ ] Add log output for admin users.
 - [ ] Add configuration messages to setup welcome messages, validation formats, roles, users access etc.
 - [ ] Create file/command for configuring channels that should exist and under which category.
+- [ ] Add way to enforce permissions when bot join.
+- [ ] Add dynamically loaded log levels.
+- [ ] Add validation memory and process to assign users after they have joined and the bot was offline..
+- [ ] Add channel creation option to generate the channels.
+- [ ] Add default welcome message for everyone that should say that a welcome message will arrive if bot is online.
+- [ ] Add better serde serialization printout. e.g. File path.
+- [x] Add code to generate roles.
+    - [ ] Add option to modify roles after creation e.g. color .

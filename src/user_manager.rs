@@ -43,8 +43,10 @@ impl UserManager {
 
         match fs::read_to_string(USER_DATABASE_FILE).await {
             Ok(content) => {
-                debug!("Successfully read database file, parsing JSON...");
-                match serde_json::from_str::<UserDatabase>(&content) {
+                info!("Successfully read database file, parsing JSON...");
+
+                let user_database: UserDatabase = serde_json::from_str(&content).unwrap();
+                match user_database {
                     Ok(user_db) => {
                         for user in user_db.users {
                             let id = user.id.clone();
@@ -411,7 +413,7 @@ impl UserManager {
             // Define channel access rules
             let should_have_access = match channel_name.as_str() {
                 // Always accessible channels
-                "welcome" | "rules" | "announcements" | "verification" => {
+                "welcome" | "rules" => {
                     debug!("Channel {} is always accessible", channel_name);
                     true
                 }
