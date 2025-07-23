@@ -22,7 +22,6 @@ chrono = { version = "0.4", features = ["serde"] }
 lazy_static = "1.4"
 once_cell = "1.18"
 
-# Cargo.toml
 [profile.dev]
 opt-level = 0
 debug = true
