@@ -1,3 +1,5 @@
+// src/role_manager.rs
+
 use anyhow::{Context, Result};
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
@@ -5,10 +7,6 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{ info, warn};
 
-// Make sure this matches your existing permissions module
-// use crate::permissions::RoleConfig;
-
-use crate::role_manager::DiscordRoleConfig as RoleConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPermission {
     pub name: String,

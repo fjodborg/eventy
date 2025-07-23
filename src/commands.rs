@@ -1,3 +1,4 @@
+// src/commands.rs
 use anyhow::Result;
 use poise::serenity_prelude as serenity;
 use tracing::{error, info};
@@ -290,6 +291,77 @@ pub async fn list_users(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_CHANNELS")]
+pub async fn setup_channels(ctx: Context<'_>) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().ok_or("This command can only be used in a guild")?;
+    
+    ctx.defer().await?;
+    
+    let channel_manager = ctx.data().channel_manager.read().await;
+    
+    match channel_manager.ensure_channels_exist(&ctx.serenity_context().http, guild_id).await {
+        Ok(_) => {
+            ctx.say("✅ Successfully setup all configured channels and categories!").await?;
+        }
+        Err(e) => {
+            error!("Failed to setup channels: {}", e);
+            ctx.say(format!("❌ Failed to setup channels: {}", e)).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Reload channel configuration from file
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_CHANNELS")]
+pub async fn reload_channel_config(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    
+    let channel_config_file = std::env::var("CHANNELS_CONFIG")
+        .unwrap_or_else(|_| "data/channels.json".to_string());
+    
+    let mut channel_manager = ctx.data().channel_manager.write().await;
+    
+    match channel_manager.reload_config(&channel_config_file).await {
+        Ok(_) => {
+            ctx.say("✅ Channel configuration reloaded successfully!").await?;
+        }
+        Err(e) => {
+            error!("Failed to reload channel config: {}", e);
+            ctx.say(format!("❌ Failed to reload channel config: {}", e)).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// List all configured channels and categories
+#[poise::command(slash_command, guild_only)]
+pub async fn list_channel_configs(ctx: Context<'_>) -> Result<(), Error> {
+    let channel_manager = ctx.data().channel_manager.read().await;
+    let configs = channel_manager.get_configs();
+    
+    if configs.is_empty() {
+        ctx.say("No channel configurations found.").await?;
+        return Ok(());
+    }
+    
+    let mut response = String::from("**Configured Channels:**\n");
+    
+    for config in configs {
+        response.push_str(&format!("• **{}** ({})\n", config.name, format!("{:?}", config.channel_type)));
+        
+        if !config.channels.is_empty() {
+            for sub_channel in &config.channels {
+                response.push_str(&format!("  ├─ {} ({})\n", sub_channel.name, format!("{:?}", sub_channel.channel_type)));
+            }
+        }
+    }
+    
+    ctx.say(response).await?;
+    Ok(())
+}
+
 async fn has_admin_permissions(ctx: Context<'_>) -> Result<bool> {
     let guild_id = match ctx.guild_id() {
         Some(id) => id,
@@ -348,7 +420,7 @@ async fn start_verification_for_user(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn handle_dm_message(
     ctx: &serenity::Context,
     msg: &serenity::Message,
-    guild_manager: &crate::guild::GuildManager,
+    guild_manager: &crate::guild_manager::GuildManager,
 ) -> Result<(), Error> {
     let verification_manager = guild_manager.get_verification_manager();
     

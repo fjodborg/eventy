@@ -1,3 +1,4 @@
+// src/main/rs
 use anyhow::Result;
 use dotenv::dotenv;
 use messages::welcome_message;
@@ -6,14 +7,16 @@ use std::env;
 use tracing::{debug, error, info, warn};
 
 mod commands;
-mod guild;
+mod guild_manager;
 mod messages;
 mod permissions;
 mod verification;
 mod role_manager;
+mod channel_manager;
 
+use channel_manager::SharedChannelManager;
 use commands::*;
-use guild::GuildManager;
+use guild_manager::GuildManager;
 use permissions::PermissionManager;
 use verification::VerificationManager;
 use role_manager::SharedRoleManager;
@@ -25,6 +28,7 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 pub struct Data {
     pub guild_manager: GuildManager,
     pub role_manager: SharedRoleManager,
+    pub channel_manager: SharedChannelManager,
 }
 
 async fn event_handler(
@@ -77,15 +81,23 @@ async fn event_handler(
         }
         serenity::FullEvent::GuildCreate { guild, .. } => {
             // Auto-setup roles when bot joins a new guild or on startup
-            info!("Setting up roles for guild: {} ({})", guild.name, guild.id);
+            // info!("Setting up roles for guild: {} ({})", guild.name, guild.id);
+            warn!("Implement startup functionality for guild: {} ({})", guild.name, guild.id);
             
-            // Use the role manager to setup roles
-            let role_manager = data.role_manager.read().await;
-            if let Err(e) = role_manager.create_roles_in_guild(&ctx.http, guild.id).await {
-                error!("Failed to setup roles for guild {}: {}", guild.id, e);
-            } else {
-                info!("Successfully setup roles for guild: {}", guild.id);
-            }
+            // let channel_manager = data.channel_manager.read().await;
+            // if let Err(e) = channel_manager.ensure_channels_exist(&ctx.http, guild.id).await {
+            //     error!("Failed to setup channels for guild {}: {}", guild.id, e);
+            // } else {
+            //     info!("Successfully setup channels for guild: {}", guild.id);
+            // }
+            
+            // // Use the role manager to setup roles
+            // let role_manager = data.role_manager.read().await;
+            // if let Err(e) = role_manager.create_roles_in_guild(&ctx.http, guild.id).await {
+            //     error!("Failed to setup roles for guild {}: {}", guild.id, e);
+            // } else {
+            //     info!("Successfully setup roles for guild: {}", guild.id);
+            // }
             
             // Also call the existing guild manager setup if needed
             if let Err(e) = data.guild_manager.setup_guild_roles(&ctx.http, guild.id).await {
@@ -136,11 +148,18 @@ async fn main() -> Result<()> {
     let token = env::var("DISCORD_TOKEN").expect("Missing DISCORD_TOKEN environment variable");
 
     // Load role configuration
-    let config_file = env::var("ROLES_CONFIG")
+    let role_config_file = env::var("ROLES_CONFIG")
         .unwrap_or_else(|_| "data/roles.json".to_string());
     
-    info!("Loading role configuration from: {}", config_file);
-    let role_manager = role_manager::create_shared_role_manager(&config_file).await?;
+    info!("Loading role configuration from: {}", role_config_file);
+    let role_manager = role_manager::create_shared_role_manager(&role_config_file).await?;
+    
+    // Load channel configuration
+    let channel_config_file = env::var("CHANNELS_CONFIG")
+        .unwrap_or_else(|_| "data/channels.json".to_string());
+    
+    info!("Loading channel configuration from: {}", channel_config_file);
+    let channel_manager = channel_manager::create_shared_channel_manager(&channel_config_file).await?;
     
     // Initialize other managers
     let verification_manager = VerificationManager::new();
@@ -159,6 +178,9 @@ async fn main() -> Result<()> {
                 update_roles(),
                 reload_role_config(),
                 list_role_configs(),
+                setup_channels(),
+                reload_channel_config(),
+                list_channel_configs(),
             ],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
@@ -182,6 +204,7 @@ async fn main() -> Result<()> {
                 Ok(Data { 
                     guild_manager,
                     role_manager: role_manager.clone(),
+                    channel_manager: channel_manager.clone(),
                 })
             })
         })

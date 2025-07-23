@@ -1,3 +1,4 @@
+// src/permissions/mod.rs
 pub mod config;
 pub mod manager;
 pub mod types;

@@ -195,3 +195,4 @@ Use the `/ping` command to verify bot connectivity and responsiveness.
 - [ ] Add better serde serialization printout. e.g. File path.
 - [x] Add code to generate roles.
     - [ ] Add option to modify roles after creation e.g. color .
+- [ ] Add separate role folder for privileged users and their id. 
