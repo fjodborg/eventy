@@ -1,3 +1,4 @@
+// src/permissions/types.rs
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 

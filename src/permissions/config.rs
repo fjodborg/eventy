@@ -1,3 +1,4 @@
+// src/permissions/config.rs
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
