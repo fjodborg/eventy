@@ -71,7 +71,9 @@ impl GuildManager {
                 "Starting verification process for new user: {}",
                 new_member.user.name
             );
-            self.setup_unverified_user(ctx, new_member).await?;
+            // TODO: clean up the channel permission code before adding this back in.,
+            // self.setup_unverified_user(ctx, new_member).await?;
+            
             self.start_verification_process(ctx, &new_member.user)
                 .await?;
         }
@@ -100,6 +102,7 @@ impl GuildManager {
         let grants = self.permission_manager.get_user_grants(discord_id);
         if !grants.is_empty() {
             self.permission_manager
+            
                 .apply_permissions_to_guild(http, guild_id, discord_id, &grants)
                 .await?;
             info!(
@@ -164,13 +167,13 @@ impl GuildManager {
 
             // TODO: roles. keep this in since this is what grants specific channel permissions.
             // Add member role
-            // if let Some(member_role) = guild.roles.values().find(|r| r.name.to_lowercase() == "medlem") {
-            //     if let Err(e) = target_member.add_role(http, member_role.id).await {
-            //         warn!("Failed to assign Member role to user {}: {}", discord_id, e);
-            //     } else {
-            //         info!("Assigned Member role to user {}", discord_id);
-            //     }
-            // }
+            if let Some(member_role) = guild.roles.values().find(|r| r.name.to_lowercase() == "medlem") {
+                if let Err(e) = target_member.add_role(http, member_role.id).await {
+                    warn!("Failed to assign Member role to user {}: {}", discord_id, e);
+                } else {
+                    info!("Assigned Member role to user {}", discord_id);
+                }
+            }
         }
 
         Ok(())

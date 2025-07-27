@@ -266,7 +266,10 @@ impl ChannelManager {
         guild_roles: &HashMap<RoleId, serenity::model::guild::Role>,
     ) -> Result<Vec<PermissionOverwrite>> {
         let mut overwrites = Vec::new();
-
+        // TODO: clean up the channel code.
+        let msg= "TODO:Channel permission overwrite is disabled. Use roles for now until code is cleanup";
+        warn!(msg);
+        anyhow::bail!(msg);
         // Find @everyone role
         let everyone_role = guild_roles
             .values()
