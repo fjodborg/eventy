@@ -147,7 +147,10 @@ impl PermissionManager {
                     grant.role_config.role, guild_id
                 );
             }
-
+            // TODO: clean up the channel code.
+            let msg= "TODO:Channel permission overwrite is disabled. Use roles for now until code is cleanup";
+            warn!(msg);
+            anyhow::bail!(msg);
             // TODO: avoid nested options. Perhaps make utility methods for this.
             // 2. Apply channel permissions (existing logic)
             if let Some(&category_id) = categories_found.get(&grant.role_config.category) {

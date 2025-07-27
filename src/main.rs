@@ -51,25 +51,28 @@ async fn event_handler(
             match find_welcome_channel(ctx, new_member.guild_id).await {
                 Ok(welcome_channel) => {
                     debug!("Found welcome channel: {} ({})", welcome_channel.name, welcome_channel.id);
+                    let msg= "TODO:Welcome message commented out since i didn't get single person messages working. 
+                                            I just sent a single message that everyone can read in welcome ";
 
+                    // TODO: make a single welcome message that get's modified.
+                    // TODO: Reenable welcome message once everything is up and running.
                     // Send welcome message in welcome channel (user-only visible)
-                    let welcome_embed = serenity::CreateEmbed::new()
-                        .title("🎉 Welcome to the Server!")
-                        .description(welcome_message(&new_member.user.name))
-                        .color(0x00ff00);
-
-                    let welcome_message = serenity::CreateMessage::new()
-                        .embed(welcome_embed)
-                        .allowed_mentions(serenity::CreateAllowedMentions::new().users([new_member.user.id]));
-
-                    match welcome_channel.send_message(&ctx.http, welcome_message).await {
-                        Ok(_) => {
-                            info!("Sent welcome message to {} in welcome channel", new_member.user.name);
-                        }
-                        Err(e) => {
-                            error!("Failed to send welcome message to {} in welcome channel: {}", new_member.user.name, e);
-                        }
-                    }
+                    // let welcome_embed = serenity::CreateEmbed::new()
+                    //     .title("🎉 Welcome to the Server!")
+                    //     .description(welcome_message(&new_member.user.name))
+                    //     .color(0x00ff00);
+                    //     .author(author);
+                    // let welcome_message = serenity::CreateMessage::new()
+                    //     .embed(welcome_embed)
+                    //     .allowed_mentions(serenity::CreateAllowedMentions::new().users([new_member.user.id]));
+                    // match welcome_channel.send_message(&ctx.http, welcome_message).await {
+                    //     Ok(_) => {
+                    //         info!("Sent welcome message to {} in welcome channel", new_member.user.name);
+                    //     }
+                    //     Err(e) => {
+                    //         error!("Failed to send welcome message to {} in welcome channel: {}", new_member.user.name, e);
+                    //     }
+                    // }
                 }
                 Err(e) => {
                     error!("Failed to find welcome channel in guild {}: {}", new_member.guild_id, e);
