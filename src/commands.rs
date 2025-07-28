@@ -144,6 +144,7 @@ pub async fn reload_role_config(ctx: Context<'_>) -> Result<(), Error> {
 
 #[poise::command(
     slash_command,
+    required_permissions = "ADMINISTRATOR",
 )]
 pub async fn list_role_configs(ctx: Context<'_>) -> Result<(), Error> {
     let role_manager = ctx.data().role_manager.read().await;
