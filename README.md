@@ -196,3 +196,4 @@ Use the `/ping` command to verify bot connectivity and responsiveness.
 - [x] Add code to generate roles.
     - [ ] Add option to modify roles after creation e.g. color .
 - [ ] Add separate role folder for privileged users and their id. 
+- [ ] Add proper command syncing

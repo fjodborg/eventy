@@ -31,6 +31,58 @@ pub struct Data {
     pub channel_manager: SharedChannelManager,
 }
 
+async fn clear_all_commands(
+    ctx: &serenity::Context,
+    guild_id: serenity::GuildId,
+) -> Result<(), Error> {
+    info!("Clearing all existing commands for guild: {}", guild_id);
+    
+    // Get all existing commands
+    let existing_commands = match guild_id.get_commands(&ctx.http).await {
+        Ok(commands) => commands,
+        Err(e) => {
+            error!("Failed to fetch existing commands for guild {}: {}", guild_id, e);
+            return Err(e.into());
+        }
+    };
+    
+    info!("Found {} existing commands in guild {}", existing_commands.len(), guild_id);
+    
+    // Delete each command individually
+    for command in existing_commands {
+        info!("Deleting command: {} (ID: {})", command.name, command.id);
+        if let Err(e) = guild_id.delete_command(&ctx.http, command.id).await {
+            error!("Failed to delete command {} ({}): {}", command.name, command.id, e);
+        } else {
+            info!("Successfully deleted command: {}", command.name);
+        }
+    }
+    
+    // Also clear global commands if any exist (usually not needed for guild bots)
+    let global_commands = match ctx.http.get_global_commands().await {
+        Ok(commands) => commands,
+        Err(e) => {
+            warn!("Failed to fetch global commands: {}", e);
+            Vec::new()
+        }
+    };
+    
+    if !global_commands.is_empty() {
+        info!("Found {} global commands, clearing them", global_commands.len());
+        for command in global_commands {
+            info!("Deleting global command: {} (ID: {})", command.name, command.id);
+            if let Err(e) = ctx.http.delete_global_command(command.id).await {
+                error!("Failed to delete global command {} ({}): {}", command.name, command.id, e);
+            } else {
+                info!("Successfully deleted global command: {}", command.name);
+            }
+        }
+    }
+    
+    info!("Finished clearing commands for guild: {}", guild_id);
+    Ok(())
+}
+
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -176,14 +228,14 @@ async fn main() -> Result<()> {
             commands: vec![
                 ping(), 
                 verify(), 
-                list_users(),
-                setup_roles(),
-                update_roles(),
-                reload_role_config(),
-                list_role_configs(),
-                setup_channels(),
-                reload_channel_config(),
-                list_channel_configs(),
+                // list_users(),
+                // setup_roles(),
+                // update_roles(),
+                // reload_role_config(),
+                // list_role_configs(),
+                // setup_channels(),
+                // reload_channel_config(),
+                // list_channel_configs(),
             ],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
@@ -195,12 +247,28 @@ async fn main() -> Result<()> {
                 info!("Bot logged in as: {}", ready.user.name);
                 
                 for guild in &ready.guilds {
+                    info!("Processing guild: {} ({})", guild.id, guild.id);
+                    
+                    // Clear all existing commands first
+                    if let Err(e) = clear_all_commands(ctx, guild.id).await {
+                        error!("Failed to clear commands for guild {}: {}", guild.id, e);
+                        // Continue anyway to try registering new commands
+                    }
+                    
+                    // Wait a bit for Discord to process the deletions
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    
+                    // Register new commands
+                    info!("Registering new commands for guild: {}", guild.id);
                     if let Err(e) = poise::builtins::register_in_guild(
                         ctx,
                         &framework.options().commands,
                         guild.id,
                     ).await {
                         error!("Failed to register commands for guild {}: {}", guild.id, e);
+                    } else {
+                        info!("Successfully registered {} commands for guild: {}", 
+                              framework.options().commands.len(), guild.id);
                     }
                 }
 
@@ -223,10 +291,6 @@ async fn main() -> Result<()> {
 
     info!("Starting bot...");
     client.start().await?;
-
-    if let Err(why) = client.start().await {
-        error!("Client error: {:?}", why);
-    }
 
     Ok(())
 }
