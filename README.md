@@ -196,3 +196,17 @@ Use the `/ping` command to verify bot connectivity and responsiveness.
 - [x] Add code to generate roles.
     - [ ] Add option to modify roles after creation e.g. color .
 - [ ] Add separate role folder for privileged users and their id. 
+
+
+### TODO Make readme about bot setup
+
+add bot id and secret to .env and token
+Modify guild id
+
+Add redirect to discord develop
+
+Open a tunnel to the WWW.
+and use it like this e.g. this: https://journals-perl-psychological-mike.trycloudflare.com/verify/my-unique-user-id
+
+add `podman run --rm -it --network host cloudflare/cloudflared:latest tunnel --url http://localhost:3000` 
+
