@@ -25,14 +25,12 @@ mod commands;
 mod config;
 mod error;
 mod events;
+mod logging;
 mod managers;
-
 mod state;
 mod web;
 
-use commands::{
-    get_config, help, ping, set_config_global, set_config_season, update_category, verify,
-};
+use commands::{get_config, help, ping, set_config_global, set_config_season, update_category};
 use events::message::handle_message;
 use events::{handle_guild_create, handle_member_add};
 use managers::{
@@ -91,8 +89,21 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+    // Create log buffer for web admin panel
+    let log_buffer = logging::create_log_buffer(1000);
+
+    // Initialize tracing with our custom layer
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_level(true),
+        )
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(logging::LogCaptureLayer::new(log_buffer.clone()))
         .init();
 
     let token = std::env::var("DISCORD_TOKEN").expect("Missing DISCORD_TOKEN environment variable");
@@ -191,7 +202,6 @@ async fn main() -> Result<()> {
             commands: vec![
                 ping(),
                 help(),
-                verify(),
                 get_config(),
                 set_config_global(),
                 set_config_season(),
@@ -259,6 +269,7 @@ async fn main() -> Result<()> {
             let channel_manager = channel_manager.clone();
             let verification_manager = verification_manager.clone();
             let maintainers_manager = maintainers_manager.clone();
+            let log_buffer = log_buffer.clone();
 
             Box::pin(async move {
                 info!("Bot logged in as: {}", ready.user.name);
@@ -301,7 +312,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Start web server for OAuth verification if configured
+                // Start web server for OAuth verification and admin panel if configured
                 if let Some(oauth_state) = web::OAuthState::from_env() {
                     let web_config = web::WebServerConfig::default();
                     let serenity_http = ctx.http.clone();
@@ -309,6 +320,20 @@ async fn main() -> Result<()> {
                     let web_config_manager = config_manager.clone();
                     let web_role_manager = role_manager.clone();
                     let web_verification_manager = verification_manager.clone();
+                    let web_log_buffer = log_buffer.clone();
+
+                    // Create session store for admin panel
+                    let session_store = web::create_session_store();
+
+                    // Get guild ID for admin permission checks
+                    let admin_guild_id = std::env::var("DISCORD_GUILD_ID")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(serenity::GuildId::new)
+                        .unwrap_or_else(|| {
+                            // Default to first guild the bot is in
+                            ready.guilds.first().map(|g| g.id).unwrap_or(serenity::GuildId::new(0))
+                        });
 
                     tokio::spawn(async move {
                         info!("Starting OAuth web server on port {}...", web_config.port);
@@ -319,6 +344,9 @@ async fn main() -> Result<()> {
                             web_role_manager,
                             web_verification_manager,
                             serenity_http,
+                            session_store,
+                            web_log_buffer,
+                            admin_guild_id,
                         ).await {
                             error!("Web server error: {}", e);
                         }

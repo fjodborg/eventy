@@ -628,6 +628,11 @@ impl ConfigManager {
         self.seasons.values().collect()
     }
 
+    /// Get seasons as a HashMap reference (for iteration with IDs)
+    pub fn get_seasons(&self) -> &HashMap<String, SeasonConfig> {
+        &self.seasons
+    }
+
     /// Find a user in any season by their verification ID
     pub fn find_user_by_verification_id(
         &self,
@@ -654,6 +659,11 @@ impl ConfigManager {
     /// Get the global structure config
     pub fn get_global_structure(&self) -> Option<&GlobalStructureConfig> {
         self.global_structure.as_ref()
+    }
+
+    /// Get the data path
+    pub fn get_data_path(&self) -> &str {
+        &self.data_path
     }
 
     /// Get a category structure config

@@ -140,32 +140,12 @@ pub async fn handle_member_add(
             }
         }
 
-        // Send welcome back message in DM
-        if let Ok(dm_channel) = new_member.user.create_dm_channel(&ctx.http).await {
-            let _ = dm_channel
-                .send_message(
-                    &ctx.http,
-                    serenity::CreateMessage::new().content(format!(
-                        "**Welcome back, {}!**\n\n\
-                    You're already verified, so your roles have been restored automatically.",
-                        tracked_user.display_name
-                    )),
-                )
-                .await;
-        }
-    } else {
-        // User is not verified - send welcome message with verification instructions
-        if let Ok(dm_channel) = new_member.user.create_dm_channel(&ctx.http).await {
-            let _ = dm_channel.send_message(&ctx.http, serenity::CreateMessage::new()
-                .content(format!(
-                    "**Welcome to the server, {}!**\n\n\
-                    To get access to the server, please verify your identity using the `/verify` command.\n\n\
-                    You can use the command in any channel or reply here.",
-                    new_member.user.name
-                ))
-            ).await;
-        }
+        info!(
+            "Restored roles for returning verified user {} ({})",
+            tracked_user.display_name, user_id
+        );
     }
+    // New unverified users will need to use the OAuth verification link
 
     Ok(())
 }

@@ -6,13 +6,16 @@ use axum::{
     routing::get,
     Router,
 };
-use poise::serenity_prelude::{self as serenity, UserId};
+use poise::serenity_prelude::{self as serenity, GuildId, UserId};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
+use super::admin::{admin_router, AdminState};
+use super::auth::SharedSessionStore;
 use super::oauth::{DiscordUser, OAuthState, TokenResponse};
+use crate::logging::SharedLogBuffer;
 use crate::managers::{SharedConfigManager, SharedRoleManager, SharedVerificationManager};
 use crate::state::TrackedUser;
 
@@ -44,7 +47,7 @@ pub struct CallbackParams {
     state: String, // This contains the UUID
 }
 
-/// Start the web server for OAuth verification
+/// Start the web server for OAuth verification and admin panel
 pub async fn start_web_server(
     config: WebServerConfig,
     oauth: OAuthState,
@@ -52,24 +55,47 @@ pub async fn start_web_server(
     role_manager: SharedRoleManager,
     verification_manager: SharedVerificationManager,
     serenity_http: Arc<serenity::Http>,
+    session_store: SharedSessionStore,
+    log_buffer: SharedLogBuffer,
+    guild_id: GuildId,
 ) -> anyhow::Result<()> {
     let state = AppState {
-        oauth,
-        config_manager,
+        oauth: oauth.clone(),
+        config_manager: config_manager.clone(),
         role_manager,
         verification_manager,
+        serenity_http: serenity_http.clone(),
+    };
+
+    // Capture base_url before moving oauth into admin_state
+    let base_url = oauth.base_url.clone();
+
+    // Create admin state
+    let admin_state = AdminState {
+        oauth,
+        config_manager,
+        session_store,
+        log_buffer,
         serenity_http,
+        guild_id,
     };
 
     let app = Router::new()
         .route("/", get(health))
         .route("/verify/:uuid", get(verify_page))
         .route("/callback", get(oauth_callback))
-        .with_state(state);
+        .with_state(state)
+        .nest("/admin", admin_router(admin_state));
 
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Web server listening on http://{}", addr);
+    info!("Admin panel available at http://{}/admin", addr);
+    info!("=== Discord OAuth Configuration ===");
+    info!("Add these Redirect URIs in Discord Developer Portal:");
+    info!("  1. {}/callback        (for user verification)", base_url);
+    info!("  2. {}/admin/callback  (for admin login)", base_url);
+    info!("Portal: https://discord.com/developers/applications -> OAuth2 -> Redirects");
 
     axum::serve(listener, app).await?;
     Ok(())

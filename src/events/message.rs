@@ -1,7 +1,6 @@
 use poise::serenity_prelude as serenity;
 use tracing::{debug, info};
 
-use crate::commands::verification::handle_dm_verification;
 use crate::{Data, Error};
 
 /// Handle incoming messages
@@ -15,9 +14,9 @@ pub async fn handle_message(
         return Ok(());
     }
 
-    // Check if this is a DM
+    // Ignore DMs - verification is now done via /verify command or OAuth
     if msg.guild_id.is_none() {
-        return handle_dm_message(ctx, msg, data).await;
+        return Ok(());
     }
 
     // Check if this is the maintainers channel
@@ -32,18 +31,6 @@ pub async fn handle_message(
     }
 
     Ok(())
-}
-
-/// Handle DM messages (for verification)
-async fn handle_dm_message(
-    ctx: &serenity::Context,
-    msg: &serenity::Message,
-    data: &Data,
-) -> Result<(), Error> {
-    debug!("Processing DM from: {}", msg.author.name);
-
-    // Handle verification attempts
-    handle_dm_verification(ctx, msg, data).await
 }
 
 /// Handle messages in the maintainers channel

@@ -209,7 +209,7 @@ impl ChannelPermissionLevel {
                     "MANAGE_NICKNAMES" => p |= Permissions::MANAGE_NICKNAMES,
                     "MANAGE_ROLES" => p |= Permissions::MANAGE_ROLES,
                     "MANAGE_WEBHOOKS" => p |= Permissions::MANAGE_WEBHOOKS,
-                    "manage_emojis" => p |= Permissions::MANAGE_GUILD_EXPRESSIONS,
+                    "MANAGE_EMOJIS" => p |= Permissions::MANAGE_GUILD_EXPRESSIONS,
                     "USE_APPLICATION_COMMANDS" => p |= Permissions::USE_APPLICATION_COMMANDS,
                     "REQUEST_TO_SPEAK" => p |= Permissions::REQUEST_TO_SPEAK,
                     "MANAGE_EVENTS" => p |= Permissions::MANAGE_EVENTS,
@@ -220,13 +220,22 @@ impl ChannelPermissionLevel {
                     "SEND_MESSAGES_IN_THREADS" => p |= Permissions::SEND_MESSAGES_IN_THREADS,
                     "USE_EMBEDDED_ACTIVITIES" => p |= Permissions::USE_EMBEDDED_ACTIVITIES,
                     "MODERATE_MEMBERS" => p |= Permissions::MODERATE_MEMBERS,
-                    _ => {}
+                    "MANAGE_GUILD_EXPRESSIONS" => p |= Permissions::MANAGE_GUILD_EXPRESSIONS,
+                    unknown => {
+                        tracing::warn!(
+                            "Unknown permission string '{}' in permission_definitions, ignoring",
+                            unknown
+                        );
+                    }
                 }
             }
             p
         };
 
         // First check if we have a custom definition for this level
+        // For voice channels, try voice-specific keys first (e.g., "read_voice")
+        let is_voice = matches!(channel_type, ChannelType::Voice | ChannelType::Stage);
+
         let level_name = match self {
             ChannelPermissionLevel::None => "none",
             ChannelPermissionLevel::Read => "read",
@@ -234,6 +243,15 @@ impl ChannelPermissionLevel {
             ChannelPermissionLevel::Admin => "admin",
         };
 
+        // Try voice-specific definition first for voice channels
+        if is_voice {
+            let voice_key = format!("{}_voice", level_name);
+            if let Some(def) = config.permission_definitions.get(&voice_key) {
+                return (parse_perms(&def.allow), parse_perms(&def.deny));
+            }
+        }
+
+        // Then try the standard definition
         if let Some(def) = config.permission_definitions.get(level_name) {
             return (parse_perms(&def.allow), parse_perms(&def.deny));
         }

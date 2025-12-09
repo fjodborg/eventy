@@ -75,12 +75,13 @@ pub async fn update_category(
         )
         .await
     {
-        Ok(_) => {
-            ctx.say(format!(
-                "Successfully updated category structure for season '{}'.",
-                season_id
-            ))
-            .await?;
+        Ok(summary) => {
+            let response = format!(
+                "**Updated category structure for season '{}'**\n\n{}",
+                season_id,
+                summary.format()
+            );
+            ctx.say(response).await?;
         }
         Err(e) => {
             ctx.say(format!("Failed to update category structure: {}", e))

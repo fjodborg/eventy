@@ -1,7 +1,6 @@
-use dashmap::DashMap;
-use poise::serenity_prelude::{ChannelId, GuildId, UserId};
+use poise::serenity_prelude::UserId;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::error::Result;
 use crate::managers::{ConfigManager, SharedConfigManager};
@@ -17,15 +16,6 @@ pub struct VerificationResult {
     pub error: Option<String>,
 }
 
-/// Pending verification state
-#[derive(Debug, Clone)]
-pub struct PendingVerification {
-    pub user_id: UserId,
-    pub channel_id: ChannelId,
-    pub guild_id: Option<GuildId>,
-    pub started_at: u64,
-}
-
 /// Manages user verification flow
 pub struct VerificationManager {
     /// User database
@@ -33,9 +23,6 @@ pub struct VerificationManager {
 
     /// Config manager for season lookups
     config_manager: SharedConfigManager,
-
-    /// Pending verifications (user_id -> pending state)
-    pending: DashMap<UserId, PendingVerification>,
 }
 
 impl VerificationManager {
@@ -43,46 +30,12 @@ impl VerificationManager {
         Self {
             user_db,
             config_manager,
-            pending: DashMap::new(),
         }
     }
 
     /// Get access to the user database (for web server integration)
     pub fn user_db(&self) -> &SharedUserDatabase {
         &self.user_db
-    }
-
-    /// Start a verification for a user
-    pub fn start_verification(
-        &self,
-        user_id: UserId,
-        channel_id: ChannelId,
-        guild_id: Option<GuildId>,
-    ) {
-        let pending = PendingVerification {
-            user_id,
-            channel_id,
-            guild_id,
-            started_at: current_timestamp(),
-        };
-        self.pending.insert(user_id, pending);
-        debug!("Started verification for user {}", user_id);
-    }
-
-    /// Check if a user has a pending verification
-    pub fn is_pending(&self, user_id: UserId) -> bool {
-        self.pending.contains_key(&user_id)
-    }
-
-    /// Get pending verification for a user
-    pub fn get_pending(&self, user_id: UserId) -> Option<PendingVerification> {
-        self.pending.get(&user_id).map(|r| r.clone())
-    }
-
-    /// Cancel a pending verification
-    pub fn cancel_verification(&self, user_id: UserId) {
-        self.pending.remove(&user_id);
-        debug!("Cancelled verification for user {}", user_id);
     }
 
     /// Check if a user is already verified (by Discord ID)
@@ -167,9 +120,6 @@ impl VerificationManager {
 
         let display_name = season_user.name.clone();
 
-        // Remove from pending
-        self.pending.remove(&user_id);
-
         // Update or create tracked user and save to database
         {
             let mut db: tokio::sync::RwLockWriteGuard<'_, UserDatabase> =
@@ -238,12 +188,6 @@ impl VerificationManager {
         let db: tokio::sync::RwLockReadGuard<'_, UserDatabase> = self.user_db.read().await;
         db.export()
     }
-
-    /// Clean up old pending verifications (older than 1 hour)
-    pub fn cleanup_stale_pending(&self) {
-        let one_hour_ago = current_timestamp().saturating_sub(3600);
-        self.pending.retain(|_, v| v.started_at > one_hour_ago);
-    }
 }
 
 /// Shared verification manager type
@@ -254,11 +198,4 @@ pub fn create_shared_verification_manager(
     config_manager: SharedConfigManager,
 ) -> SharedVerificationManager {
     Arc::new(VerificationManager::new(user_db, config_manager))
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

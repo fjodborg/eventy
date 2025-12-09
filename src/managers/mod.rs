@@ -4,7 +4,7 @@ pub mod maintainers_manager;
 pub mod role_manager;
 pub mod verification_manager;
 
-pub use channel_manager::{create_shared_channel_manager, SharedChannelManager};
+pub use channel_manager::{create_shared_channel_manager, SharedChannelManager, UpdateSummary};
 pub use config_manager::{create_shared_config_manager, ConfigManager, SharedConfigManager};
 pub use maintainers_manager::{create_shared_maintainers_manager, SharedMaintainersManager};
 pub use role_manager::{create_shared_role_manager, SharedRoleManager};
