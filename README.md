@@ -1,5 +1,13 @@
 # Eventy - Discord Verification Bot
 
+> **Note:** This project is still in active development. The name "Eventy" is a remnant from its original purpose as an event management tool - it has since evolved into a verification and server management bot. The name will likely change in the future.
+
+## Background
+
+This bot was developed as a volunteer project to help migrate an organization from Facebook to Discord. Facebook's notification system didn't meet the organization's needs, so I built this bot to handle verification, role-based access control, and seasonal member management.
+
+## Overview
+
 A Discord bot built in Rust that provides automated user verification through OAuth2, role management, and channel access control. The bot supports seasonal member management and ensures only verified users can access member-only channels.
 
 ## Features
