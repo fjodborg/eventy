@@ -2,22 +2,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{SeasonConfig, SpecialMembersConfig, GlobalStructureConfig, CategoryStructureConfig};
+use super::{SeasonUser, SpecialMembersConfig};
+
+/// Staged users for a season
+#[derive(Debug, Clone)]
+pub struct StagedSeasonUsers {
+    pub season_id: String,
+    pub users: Vec<SeasonUser>,
+}
 
 /// Staged configuration waiting to be committed
 #[derive(Debug, Clone, Default)]
 pub struct StagedConfig {
-    /// Staged season configs (season_id -> config)
-    pub seasons: HashMap<String, SeasonConfig>,
+    /// Staged season users (season_id -> users)
+    pub seasons: HashMap<String, StagedSeasonUsers>,
 
-    /// Staged special members config
+    /// Staged special members config (assignments.json)
     pub special_members: Option<SpecialMembersConfig>,
-
-    /// Staged global structure config
-    pub global_structure: Option<GlobalStructureConfig>,
-
-    /// Staged category structures (season_id -> config)
-    pub category_structures: HashMap<String, CategoryStructureConfig>,
 
     /// When the config was staged
     pub staged_at: u64,
@@ -36,15 +37,20 @@ impl StagedConfig {
 
     /// Check if there's anything staged
     pub fn is_empty(&self) -> bool {
-        self.seasons.is_empty()
-            && self.special_members.is_none()
-            && self.global_structure.is_none()
-            && self.category_structures.is_empty()
+        self.seasons.is_empty() && self.special_members.is_none()
     }
 
-    /// Stage a season config
-    pub fn stage_season(&mut self, config: SeasonConfig, staged_by: Option<String>) {
-        self.seasons.insert(config.season_id.clone(), config);
+    /// Stage users for a season
+    pub fn stage_season_users(
+        &mut self,
+        season_id: String,
+        users: Vec<SeasonUser>,
+        staged_by: Option<String>,
+    ) {
+        self.seasons.insert(
+            season_id.clone(),
+            StagedSeasonUsers { season_id, users },
+        );
         self.staged_at = current_timestamp();
         self.staged_by = staged_by;
     }
@@ -56,26 +62,10 @@ impl StagedConfig {
         self.staged_by = staged_by;
     }
 
-    /// Stage global structure config
-    pub fn stage_global_structure(&mut self, config: GlobalStructureConfig, staged_by: Option<String>) {
-        self.global_structure = Some(config);
-        self.staged_at = current_timestamp();
-        self.staged_by = staged_by;
-    }
-
-    /// Stage a category structure config
-    pub fn stage_category_structure(&mut self, config: CategoryStructureConfig, staged_by: Option<String>) {
-        self.category_structures.insert(config.season_id.clone(), config);
-        self.staged_at = current_timestamp();
-        self.staged_by = staged_by;
-    }
-
     /// Clear all staged configs
     pub fn clear(&mut self) {
         self.seasons.clear();
         self.special_members = None;
-        self.global_structure = None;
-        self.category_structures.clear();
         self.staged_at = 0;
         self.staged_by = None;
     }
@@ -85,21 +75,15 @@ impl StagedConfig {
         let mut parts = Vec::new();
 
         if !self.seasons.is_empty() {
-            let season_ids: Vec<_> = self.seasons.keys().collect();
-            parts.push(format!("Seasons: {}", season_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+            let season_info: Vec<_> = self.seasons
+                .iter()
+                .map(|(id, staged)| format!("{} ({} users)", id, staged.users.len()))
+                .collect();
+            parts.push(format!("Seasons: {}", season_info.join(", ")));
         }
 
         if self.special_members.is_some() {
-            parts.push("Special Members".to_string());
-        }
-
-        if self.global_structure.is_some() {
-            parts.push("Global Structure".to_string());
-        }
-
-        if !self.category_structures.is_empty() {
-            let category_ids: Vec<_> = self.category_structures.keys().collect();
-            parts.push(format!("Category Structures: {}", category_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+            parts.push("Special Members (assignments.json)".to_string());
         }
 
         if parts.is_empty() {
@@ -146,7 +130,10 @@ impl ConfigDiff {
         if !self.additions.is_empty() {
             output.push_str("**Additions:**\n");
             for change in &self.additions {
-                output.push_str(&format!("+ {} ({}): {}\n", change.entity_type, change.entity_name, change.details));
+                output.push_str(&format!(
+                    "+ {} ({}): {}\n",
+                    change.entity_type, change.entity_name, change.details
+                ));
             }
             output.push('\n');
         }
@@ -154,7 +141,10 @@ impl ConfigDiff {
         if !self.modifications.is_empty() {
             output.push_str("**Modifications:**\n");
             for change in &self.modifications {
-                output.push_str(&format!("~ {} ({}): {}\n", change.entity_type, change.entity_name, change.details));
+                output.push_str(&format!(
+                    "~ {} ({}): {}\n",
+                    change.entity_type, change.entity_name, change.details
+                ));
             }
             output.push('\n');
         }
@@ -162,7 +152,10 @@ impl ConfigDiff {
         if !self.deletions.is_empty() {
             output.push_str("**Deletions:**\n");
             for change in &self.deletions {
-                output.push_str(&format!("- {} ({}): {}\n", change.entity_type, change.entity_name, change.details));
+                output.push_str(&format!(
+                    "- {} ({}): {}\n",
+                    change.entity_type, change.entity_name, change.details
+                ));
             }
         }
 
@@ -178,13 +171,18 @@ impl ConfigDiff {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigChange {
     pub change_type: ConfigChangeType,
-    pub entity_type: String,  // "season", "role", "channel", "user", etc.
+    pub entity_type: String, // "season", "role", "channel", "user", etc.
     pub entity_name: String,
     pub details: String,
 }
 
 impl ConfigChange {
-    pub fn new(change_type: ConfigChangeType, entity_type: &str, entity_name: &str, details: &str) -> Self {
+    pub fn new(
+        change_type: ConfigChangeType,
+        entity_type: &str,
+        entity_name: &str,
+        details: &str,
+    ) -> Self {
         Self {
             change_type,
             entity_type: entity_type.to_string(),
@@ -219,15 +217,7 @@ mod tests {
         let mut staged = StagedConfig::new();
         assert_eq!(staged.get_summary(), "Nothing staged");
 
-        staged.stage_season(
-            SeasonConfig {
-                season_id: "2025E".to_string(),
-                name: "Test".to_string(),
-                active: true,
-                users: vec![],
-            },
-            None,
-        );
+        staged.stage_season_users("2025E".to_string(), vec![], None);
 
         assert!(staged.get_summary().contains("2025E"));
     }

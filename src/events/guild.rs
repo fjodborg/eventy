@@ -28,14 +28,14 @@ pub async fn handle_guild_create(
         }
     }
 
-    // If we have a global structure, ensure roles and channels exist
+    // If we have global roles, ensure they exist
     let config_manager = data.config_manager.read().await;
-    if let Some(global_structure) = config_manager.get_global_structure() {
+    if let Some(global_roles) = config_manager.get_global_roles() {
         // Ensure roles exist
         {
             let role_manager = data.role_manager.read().await;
             match role_manager
-                .ensure_roles_exist(&ctx.http, guild.id, &global_structure.default_roles)
+                .ensure_roles_exist(&ctx.http, guild.id, &global_roles.roles)
                 .await
             {
                 Ok(roles) => {
@@ -47,8 +47,7 @@ pub async fn handle_guild_create(
             }
         }
 
-        // Ensure category structures exist
-        // Automatic verification is disabled to prevent overwriting manual changes or causing lag
+        // Automatic structure verification is disabled to prevent overwriting manual changes or causing lag
         // Users should run /update_category manually
         info!(
             "Automatic structure verification is disabled. Run /update_category to apply changes."
@@ -119,11 +118,21 @@ pub async fn handle_member_add(
             );
         }
 
-        // Get roles to assign
+        // Get roles to assign based on the seasons the user is verified for
         let config_manager = data.config_manager.read().await;
-        let default_role = config_manager.get_default_member_role_name().to_string();
 
-        let mut roles_to_assign = vec![default_role];
+        // For each season the user is verified in, get that season's member role
+        let mut roles_to_assign: Vec<String> = Vec::new();
+        for season_id in tracked_user.verification_ids.keys() {
+            if let Some(season) = config_manager.get_season(season_id) {
+                let member_role = season.member_role();
+                if !roles_to_assign.contains(&member_role) {
+                    roles_to_assign.push(member_role);
+                }
+            }
+        }
+
+        // Add special roles
         roles_to_assign.extend(tracked_user.special_roles.clone());
 
         // Assign roles

@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// State tracking for Discord channels, categories, and roles
 /// Used to minimize API calls by caching what's already been created
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelState {
     /// Schema version
     pub version: u32,
@@ -105,6 +106,7 @@ pub enum EntityType {
 
 /// State for a single guild
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuildChannelState {
     pub guild_id: String,
     pub guild_name: String,
@@ -208,6 +210,7 @@ impl GuildChannelState {
 
 /// State for a category
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CategoryState {
     pub discord_id: String,
     pub name: String,
@@ -218,6 +221,7 @@ pub struct CategoryState {
 
 /// State for a channel
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelStateEntry {
     pub discord_id: String,
     pub name: String,
@@ -230,6 +234,7 @@ pub struct ChannelStateEntry {
 
 /// State for a role
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleState {
     pub discord_id: String,
     pub name: String,

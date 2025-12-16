@@ -29,6 +29,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Web server for OAuth verification
 axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.5", features = ["cors"] }
 reqwest = { version = "0.11", features = ["json"] }
 urlencoding = "2.1"
@@ -46,9 +47,11 @@ panic = 'unwind'
 rpath = false
 
 [profile.release]
-opt-level = 3
+# opt-level = 3
+opt-level = "z"  # Optimize for size.
 lto = "thin"
 codegen-units = 16
+strip = true 
 
 [profile.quick-release]
 inherits = "release"

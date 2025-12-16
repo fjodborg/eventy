@@ -30,12 +30,13 @@ mod managers;
 mod state;
 mod web;
 
-use commands::{get_config, help, ping, set_config_global, set_config_season, update_category};
+use commands::{get_config, help, ping, restart, set_config_global, set_config_season, update_category, update_roles};
 use events::message::handle_message;
 use events::{handle_guild_create, handle_member_add};
 use managers::{
-    create_shared_channel_manager, create_shared_config_manager, create_shared_maintainers_manager,
-    create_shared_role_manager, create_shared_verification_manager, SharedChannelManager,
+    check_role_permission_management, create_shared_channel_manager, create_shared_config_manager,
+    create_shared_maintainers_manager, create_shared_role_manager, create_shared_verification_manager,
+    log_role_permission_management_check, run_startup_permission_check, SharedChannelManager,
     SharedConfigManager, SharedMaintainersManager, SharedRoleManager, SharedVerificationManager,
 };
 use state::{
@@ -202,10 +203,12 @@ async fn main() -> Result<()> {
             commands: vec![
                 ping(),
                 help(),
+                restart(),
                 get_config(),
                 set_config_global(),
                 set_config_season(),
                 update_category(),
+                update_roles(),
             ],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
@@ -274,6 +277,47 @@ async fn main() -> Result<()> {
             Box::pin(async move {
                 info!("Bot logged in as: {}", ready.user.name);
 
+                // Run permission check for all guilds
+                let guild_ids: Vec<serenity::GuildId> = ready.guilds.iter().map(|g| g.id).collect();
+                if !guild_ids.is_empty() {
+                    run_startup_permission_check(ctx.http.as_ref(), &guild_ids).await;
+
+                    // Check if bot can manage role permissions (for roles not marked skip_permission_sync)
+                    let config = config_manager.read().await;
+                    if let Some(global_roles) = config.get_global_roles() {
+                        let roles_to_manage: Vec<String> = global_roles
+                            .roles
+                            .iter()
+                            .filter(|r| !r.skip_permission_sync)
+                            .map(|r| r.name.clone())
+                            .collect();
+
+                        if !roles_to_manage.is_empty() {
+                            for guild_id in &guild_ids {
+                                match check_role_permission_management(
+                                    ctx.http.as_ref(),
+                                    *guild_id,
+                                    &roles_to_manage,
+                                )
+                                .await
+                                {
+                                    Ok(check) => {
+                                        log_role_permission_management_check(&check);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to check role permission management: {}", e);
+                                    }
+                                }
+                            }
+                        } else {
+                            info!("All roles have skip_permission_sync=true, skipping role permission management check");
+                        }
+                    }
+                    drop(config);
+                } else {
+                    warn!("Bot is not in any guilds - skipping permission check");
+                }
+
                 // Determine which guilds to register commands for
                 let guilds_to_register: Vec<serenity::GuildId> = if let Some(gid) = target_guild_id {
                     // Only register to specific guild
@@ -314,12 +358,13 @@ async fn main() -> Result<()> {
 
                 // Start web server for OAuth verification and admin panel if configured
                 if let Some(oauth_state) = web::OAuthState::from_env() {
-                    let web_config = web::WebServerConfig::default();
+                    let web_config = web::WebServerConfig::from_env();
                     let serenity_http = ctx.http.clone();
 
                     let web_config_manager = config_manager.clone();
                     let web_role_manager = role_manager.clone();
                     let web_verification_manager = verification_manager.clone();
+                    let web_channel_manager = channel_manager.clone();
                     let web_log_buffer = log_buffer.clone();
 
                     // Create session store for admin panel
@@ -336,13 +381,14 @@ async fn main() -> Result<()> {
                         });
 
                     tokio::spawn(async move {
-                        info!("Starting OAuth web server on port {}...", web_config.port);
+                        info!("Starting OAuth web server on HTTPS port {}...", web_config.https_port);
                         if let Err(e) = web::start_web_server(
                             web_config,
                             oauth_state,
                             web_config_manager,
                             web_role_manager,
                             web_verification_manager,
+                            web_channel_manager,
                             serenity_http,
                             session_store,
                             web_log_buffer,

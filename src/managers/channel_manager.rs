@@ -21,7 +21,9 @@ pub struct UpdateSummary {
     pub category_existing: Option<String>,
     pub channels_created: Vec<String>,
     pub channels_updated: Vec<String>,
+    pub channels_reordered: Vec<String>,
     pub permissions_applied: Vec<(String, String, String)>, // (channel, role, level)
+    pub missing_roles: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -53,10 +55,18 @@ impl UpdateSummary {
         if !self.channels_updated.is_empty() {
             lines.push(format!("**Channels updated:** {}", self.channels_updated.join(", ")));
         }
+        if !self.channels_reordered.is_empty() {
+            lines.push(format!("**Channels reordered:** {}", self.channels_reordered.join(", ")));
+        }
 
         // Permissions summary
         if !self.permissions_applied.is_empty() {
             lines.push(format!("**Permissions configured:** {} role/channel pairs", self.permissions_applied.len()));
+        }
+
+        // Missing roles
+        if !self.missing_roles.is_empty() {
+            lines.push(format!("**Missing roles:** {}", self.missing_roles.join(", ")));
         }
 
         // Warnings
@@ -139,11 +149,13 @@ impl ChannelManager {
 
         let mut permission_overwrites = vec![];
 
-        // Deny everyone
+        // Deny everyone - VIEW_CHANNEL and CONNECT for channel isolation
+        // Note: MANAGE_NICKNAMES and CHANGE_NICKNAME are server-level permissions,
+        // they cannot be set as channel overwrites
         if let Some(everyone_id) = everyone_role {
             permission_overwrites.push(serenity::PermissionOverwrite {
                 allow: Permissions::empty(),
-                deny: Permissions::VIEW_CHANNEL,
+                deny: Permissions::VIEW_CHANNEL | Permissions::CONNECT,
                 kind: serenity::PermissionOverwriteType::Role(everyone_id),
             });
         }
@@ -372,16 +384,27 @@ impl ChannelManager {
         let mut overwrites = Vec::new();
         let role_manager = self.role_manager.read().await;
 
+        // Get permission definitions from config
+        let config = self.config_manager.read().await;
+        let permission_definitions = config
+            .get_global_permissions()
+            .map(|p| p.definitions.clone())
+            .unwrap_or_default();
+        drop(config);
+
+        // Build a GlobalStructureConfig with the loaded permission definitions
+        let global_config = GlobalStructureConfig {
+            permission_definitions,
+            ..Default::default()
+        };
+
         for (role_name, level) in role_permissions {
             match role_manager.get_role_id(http, guild_id, role_name).await {
                 Ok(role_id) => {
-                    let (allow, deny) = level.to_permissions(
-                        channel_type,
-                        self.config_manager
-                            .read()
-                            .await
-                            .get_global_structure()
-                            .unwrap_or(&GlobalStructureConfig::default()),
+                    let (allow, deny) = level.to_permissions(channel_type, &global_config);
+                    info!(
+                        "Permission overwrite for role '{}': allow={:?}, deny={:?}",
+                        role_name, allow, deny
                     );
                     overwrites.push(serenity::PermissionOverwrite {
                         allow,
@@ -534,26 +557,71 @@ impl ChannelManager {
             }
         }
 
+        // Get the bot's user ID to add explicit permission for it
+        let bot_user = http.get_current_user().await?;
+        let bot_user_id = bot_user.id;
+
         // Check Discord
         let channels = guild_id.channels(http).await?;
         for (channel_id, channel) in &channels {
             if channel.kind == serenity::ChannelType::Category && channel.name == name {
                 // Update cache
-                let mut state = self.state.write().await;
-                let guild_name = "";
-                let guild = state.get_guild_mut(&guild_id.to_string(), guild_name);
-                guild.add_category(name, &channel_id.to_string(), channel.position as u16);
+                {
+                    let mut state = self.state.write().await;
+                    let guild_name = "";
+                    let guild = state.get_guild_mut(&guild_id.to_string(), guild_name);
+                    guild.add_category(name, &channel_id.to_string(), channel.position as u16);
+                }
+
+                // Ensure bot has permission on existing category
+                // This is needed in case @everyone was denied but bot wasn't given explicit access
+                let existing_overwrites = channel.permission_overwrites.clone();
+                let has_bot_permission = existing_overwrites.iter().any(|ow| {
+                    matches!(ow.kind, serenity::PermissionOverwriteType::Member(m) if m == bot_user_id)
+                });
+
+                if !has_bot_permission {
+                    debug!("Adding bot permission to existing category '{}'", name);
+                    let mut new_overwrites = existing_overwrites;
+                    // Note: We don't include MANAGE_ROLES here because that's a server-level permission
+                    // The bot needs MANAGE_ROLES at server level, not channel level
+                    new_overwrites.push(serenity::PermissionOverwrite {
+                        allow: Permissions::VIEW_CHANNEL
+                            | Permissions::MANAGE_CHANNELS
+                            | Permissions::SEND_MESSAGES
+                            | Permissions::CONNECT,
+                        deny: Permissions::empty(),
+                        kind: serenity::PermissionOverwriteType::Member(bot_user_id),
+                    });
+
+                    if let Err(e) = channel_id
+                        .edit(http, serenity::EditChannel::new().permissions(new_overwrites))
+                        .await
+                    {
+                        warn!("Failed to add bot permission to category '{}': {}", name, e);
+                    }
+                }
 
                 debug!("Category '{}' already exists on Discord", name);
                 return Ok((*channel_id, false));
             }
         }
 
-        // Create category
+        // Create category with bot permission already set
+        // Note: We don't include MANAGE_ROLES in the overwrite - that's a server-level permission
         let channel = guild_id
             .create_channel(
                 http,
-                serenity::CreateChannel::new(name).kind(serenity::ChannelType::Category),
+                serenity::CreateChannel::new(name)
+                    .kind(serenity::ChannelType::Category)
+                    .permissions(vec![serenity::PermissionOverwrite {
+                        allow: Permissions::VIEW_CHANNEL
+                            | Permissions::MANAGE_CHANNELS
+                            | Permissions::SEND_MESSAGES
+                            | Permissions::CONNECT,
+                        deny: Permissions::empty(),
+                        kind: serenity::PermissionOverwriteType::Member(bot_user_id),
+                    }]),
             )
             .await?;
 
@@ -565,7 +633,7 @@ impl ChannelManager {
             guild.add_category(name, &channel.id.to_string(), 0);
         }
 
-        info!("Created category '{}'", name);
+        info!("Created category '{}' with bot permission", name);
         Ok((channel.id, true))
     }
 
@@ -696,17 +764,24 @@ impl ChannelManager {
         let mut overwrites = Vec::new();
         let role_manager = self.role_manager.read().await;
 
+        // Get permission definitions from config
+        let config = self.config_manager.read().await;
+        let permission_definitions = config
+            .get_global_permissions()
+            .map(|p| p.definitions.clone())
+            .unwrap_or_default();
+        drop(config);
+
+        // Build a GlobalStructureConfig with the loaded permission definitions
+        let global_config = GlobalStructureConfig {
+            permission_definitions,
+            ..Default::default()
+        };
+
         for (role_name, level) in role_permissions {
             match role_manager.get_role_id(http, guild_id, role_name).await {
                 Ok(role_id) => {
-                    let (allow, deny) = level.to_permissions(
-                        channel_type,
-                        self.config_manager
-                            .read()
-                            .await
-                            .get_global_structure()
-                            .unwrap_or(&GlobalStructureConfig::default()),
-                    );
+                    let (allow, deny) = level.to_permissions(channel_type, &global_config);
                     overwrites.push(serenity::PermissionOverwrite {
                         allow,
                         deny,
@@ -725,12 +800,13 @@ impl ChannelManager {
                     ));
                 }
                 Err(e) => {
-                    let msg = format!(
+                    warn!(
                         "Could not find role '{}' for channel '{}': {}",
                         role_name, channel_name, e
                     );
-                    warn!("{}", msg);
-                    summary.warnings.push(msg);
+                    if !summary.missing_roles.contains(role_name) {
+                        summary.missing_roles.push(role_name.clone());
+                    }
                 }
             }
         }
@@ -762,6 +838,425 @@ impl ChannelManager {
             }
         }
         None
+    }
+
+    /// Sync a season's channels to Discord
+    ///
+    /// Creates/updates a category with the given name and syncs all channels within it.
+    /// Automatically denies @everyone access to ensure season isolation.
+    /// Returns an UpdateSummary with details of what was created/updated.
+    pub async fn sync_season_channels(
+        &self,
+        http: &Http,
+        guild_id: GuildId,
+        category_name: &str,
+        channels: &[ChannelDefinition],
+    ) -> Result<UpdateSummary> {
+        let mut summary = UpdateSummary::default();
+
+        // Ensure category exists
+        info!("Syncing season channels: category='{}', {} channels", category_name, channels.len());
+        let (category_id, cat_created) = self
+            .ensure_category_exists_tracked(http, guild_id, category_name)
+            .await?;
+
+        if cat_created {
+            summary.category_created = Some(category_name.to_string());
+        } else {
+            summary.category_existing = Some(category_name.to_string());
+        }
+
+        // Set @everyone deny on the category itself for season isolation
+        if let Err(e) = self.deny_everyone_on_channel(http, guild_id, category_id).await {
+            warn!("Failed to set @everyone deny on category '{}': {}", category_name, e);
+            summary.warnings.push(format!("Failed to deny @everyone on category: {}", e));
+        } else {
+            info!("Set @everyone deny on category '{}'", category_name);
+        }
+
+        // Create/update each channel
+        for channel_def in channels {
+            let (channel_id, created, updated) = self
+                .ensure_channel_exists_tracked_with_everyone_deny(
+                    http,
+                    guild_id,
+                    channel_def,
+                    Some(category_id),
+                    &mut summary,
+                )
+                .await?;
+
+            if created {
+                summary.channels_created.push(channel_def.name.clone());
+            } else if updated {
+                summary.channels_updated.push(channel_def.name.clone());
+            }
+        }
+
+        // Reorder channels based on their position field
+        match self.reorder_channels_in_category(http, guild_id, category_id, channels).await {
+            Ok(reordered) => {
+                if !reordered.is_empty() {
+                    info!("Reordered {} channels in category '{}'", reordered.len(), category_name);
+                    summary.channels_reordered = reordered;
+                }
+            }
+            Err(e) => {
+                warn!("Failed to reorder channels in category '{}': {}", category_name, e);
+                summary.warnings.push(format!("Failed to reorder channels: {}", e));
+            }
+        }
+
+        info!(
+            "Season sync complete: category={}, created={}, updated={}, missing_roles={}",
+            category_name,
+            summary.channels_created.len(),
+            summary.channels_updated.len(),
+            summary.missing_roles.len()
+        );
+
+        Ok(summary)
+    }
+
+    /// Reorder channels within a category based on their position field
+    /// Returns a list of channel names that were reordered
+    async fn reorder_channels_in_category(
+        &self,
+        http: &Http,
+        guild_id: GuildId,
+        category_id: ChannelId,
+        channel_defs: &[ChannelDefinition],
+    ) -> Result<Vec<String>> {
+        // Get all channels in the guild
+        let guild_channels = guild_id.channels(http).await?;
+
+        // Find channels that belong to this category and have position defined
+        let mut channels_to_reorder: Vec<(ChannelId, String, u16)> = Vec::new();
+
+        for channel_def in channel_defs {
+            // Only process channels that have a position defined
+            if let Some(position) = channel_def.position {
+                // Find the channel ID by name within this category
+                for (channel_id, channel) in &guild_channels {
+                    if channel.name == channel_def.name && channel.parent_id == Some(category_id) {
+                        channels_to_reorder.push((*channel_id, channel_def.name.clone(), position));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if channels_to_reorder.is_empty() {
+            debug!("No channels with position field to reorder");
+            return Ok(Vec::new());
+        }
+
+        // Sort by position
+        channels_to_reorder.sort_by_key(|(_, _, pos)| *pos);
+
+        info!(
+            "Reordering {} channels in category",
+            channels_to_reorder.len()
+        );
+
+        let mut reordered_names = Vec::new();
+
+        // Use Discord's edit channel endpoint to set positions
+        // We need to set positions relative to each other within the category
+        for (channel_id, channel_name, position) in &channels_to_reorder {
+            if let Err(e) = channel_id
+                .edit(http, serenity::EditChannel::new().position(*position))
+                .await
+            {
+                warn!(
+                    "Failed to set position {} for channel '{}': {}",
+                    position, channel_name, e
+                );
+            } else {
+                debug!("Set channel '{}' position to {}", channel_name, position);
+                reordered_names.push(channel_name.clone());
+            }
+        }
+
+        Ok(reordered_names)
+    }
+
+    /// Deny @everyone access to a channel/category while ensuring bot keeps access
+    async fn deny_everyone_on_channel(
+        &self,
+        http: &Http,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<()> {
+        let guild = guild_id.to_partial_guild(http).await?;
+        let everyone_role_id = guild.id.everyone_role();
+
+        // Get the bot's user ID to add explicit permission for it
+        let bot_user = http.get_current_user().await?;
+        let bot_user_id = bot_user.id;
+
+        // Get existing permission overwrites to preserve them
+        let channel = channel_id.to_channel(http).await?;
+        let existing_overwrites = match &channel {
+            serenity::Channel::Guild(gc) => gc.permission_overwrites.clone(),
+            _ => vec![],
+        };
+
+        // Build new overwrites, updating @everyone if it exists or adding it
+        // Also remove any existing bot user overwrite so we can add a fresh one
+        let mut new_overwrites: Vec<serenity::PermissionOverwrite> = existing_overwrites
+            .into_iter()
+            .filter(|ow| {
+                // Remove existing @everyone overwrite, we'll add our own
+                if matches!(ow.kind, serenity::PermissionOverwriteType::Role(r) if r == everyone_role_id) {
+                    return false;
+                }
+                // Remove existing bot user overwrite, we'll add our own
+                if matches!(ow.kind, serenity::PermissionOverwriteType::Member(m) if m == bot_user_id) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        // Add bot user permission FIRST - ensure bot can always access and manage
+        // Note: MANAGE_ROLES is a server-level permission, not channel-level
+        new_overwrites.push(serenity::PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL
+                | Permissions::MANAGE_CHANNELS
+                | Permissions::SEND_MESSAGES
+                | Permissions::CONNECT,
+            deny: Permissions::empty(),
+            kind: serenity::PermissionOverwriteType::Member(bot_user_id),
+        });
+
+        // Add @everyone deny - VIEW_CHANNEL and CONNECT for channel isolation
+        // Note: MANAGE_NICKNAMES and CHANGE_NICKNAME are server-level permissions,
+        // they cannot be set as channel overwrites
+        new_overwrites.push(serenity::PermissionOverwrite {
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+            kind: serenity::PermissionOverwriteType::Role(everyone_role_id),
+        });
+
+        channel_id
+            .edit(http, serenity::EditChannel::new().permissions(new_overwrites))
+            .await?;
+
+        Ok(())
+    }
+
+    /// Ensure a channel exists with @everyone denied, returning whether it was created or updated
+    async fn ensure_channel_exists_tracked_with_everyone_deny(
+        &self,
+        http: &Http,
+        guild_id: GuildId,
+        channel_def: &ChannelDefinition,
+        parent_id: Option<ChannelId>,
+        summary: &mut UpdateSummary,
+    ) -> Result<(ChannelId, bool, bool)> {
+        // Check Discord for existing channel
+        let channels = guild_id.channels(http).await?;
+        for (channel_id, channel) in &channels {
+            if channel.name == channel_def.name {
+                // Check if parent matches (if specified)
+                if let Some(parent) = parent_id {
+                    if channel.parent_id != Some(parent) {
+                        continue;
+                    }
+                }
+
+                // Update cache
+                {
+                    let mut state = self.state.write().await;
+                    let guild_name = "";
+                    let guild = state.get_guild_mut(&guild_id.to_string(), guild_name);
+                    let parent_name = parent_id.map(|id| id.to_string());
+                    guild.add_channel(
+                        &channel_def.name,
+                        &channel_id.to_string(),
+                        parent_name.as_deref(),
+                        &format!("{:?}", channel_def.channel_type),
+                    );
+                }
+
+                // Build permissions WITH @everyone deny
+                let permission_overwrites = self
+                    .build_permission_overwrites_with_everyone_deny(
+                        http,
+                        guild_id,
+                        &channel_def.role_permissions,
+                        &channel_def.channel_type,
+                        &channel_def.name,
+                        summary,
+                    )
+                    .await?;
+
+                if let Err(e) = channel_id
+                    .edit(
+                        http,
+                        serenity::EditChannel::new().permissions(permission_overwrites),
+                    )
+                    .await
+                {
+                    let msg = format!(
+                        "Failed to update permissions for channel '{}': {}",
+                        channel_def.name, e
+                    );
+                    warn!("{}", msg);
+                    summary.warnings.push(msg);
+                    return Ok((*channel_id, false, false));
+                }
+
+                info!(
+                    "Updated permissions for existing channel '{}' (with @everyone deny)",
+                    channel_def.name
+                );
+                return Ok((*channel_id, false, true));
+            }
+        }
+
+        // Build permission overwrites for new channel WITH @everyone deny
+        let permission_overwrites = self
+            .build_permission_overwrites_with_everyone_deny(
+                http,
+                guild_id,
+                &channel_def.role_permissions,
+                &channel_def.channel_type,
+                &channel_def.name,
+                summary,
+            )
+            .await?;
+
+        // Create channel
+        let mut create_channel = serenity::CreateChannel::new(&channel_def.name)
+            .kind(channel_def.channel_type.to_serenity())
+            .permissions(permission_overwrites);
+
+        if let Some(parent) = parent_id {
+            create_channel = create_channel.category(parent);
+        }
+
+        let channel = guild_id.create_channel(http, create_channel).await?;
+
+        // Update cache
+        {
+            let mut state = self.state.write().await;
+            let guild_name = "";
+            let guild = state.get_guild_mut(&guild_id.to_string(), guild_name);
+            let parent_name = parent_id.map(|id| id.to_string());
+            guild.add_channel(
+                &channel_def.name,
+                &channel.id.to_string(),
+                parent_name.as_deref(),
+                &format!("{:?}", channel_def.channel_type),
+            );
+        }
+
+        info!(
+            "Created channel '{}' ({:?}) with @everyone deny",
+            channel_def.name, channel_def.channel_type
+        );
+        Ok((channel.id, true, false))
+    }
+
+    /// Build permission overwrites with @everyone denied and track them in the summary
+    async fn build_permission_overwrites_with_everyone_deny(
+        &self,
+        http: &Http,
+        guild_id: GuildId,
+        role_permissions: &HashMap<String, ChannelPermissionLevel>,
+        channel_type: &ChannelType,
+        channel_name: &str,
+        summary: &mut UpdateSummary,
+    ) -> Result<Vec<serenity::PermissionOverwrite>> {
+        let mut overwrites = Vec::new();
+        let role_manager = self.role_manager.read().await;
+
+        // Get @everyone role ID and deny it
+        let guild = guild_id.to_partial_guild(http).await?;
+        let everyone_role_id = guild.id.everyone_role();
+
+        // Get the bot's user ID to add explicit permission for it
+        let bot_user = http.get_current_user().await?;
+        let bot_user_id = bot_user.id;
+
+        // Add bot user permission FIRST - ensure bot can always access and manage the channel
+        // Note: MANAGE_ROLES is a server-level permission, not channel-level
+        overwrites.push(serenity::PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL
+                | Permissions::MANAGE_CHANNELS
+                | Permissions::SEND_MESSAGES
+                | Permissions::CONNECT,
+            deny: Permissions::empty(),
+            kind: serenity::PermissionOverwriteType::Member(bot_user_id),
+        });
+        debug!(
+            "  {} -> Bot = allow (VIEW_CHANNEL, MANAGE_CHANNELS, SEND_MESSAGES, CONNECT)",
+            channel_name
+        );
+
+        // Add @everyone deny - VIEW_CHANNEL and CONNECT for channel isolation
+        // Note: MANAGE_NICKNAMES and CHANGE_NICKNAME are server-level permissions,
+        // they cannot be set as channel overwrites
+        overwrites.push(serenity::PermissionOverwrite {
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL | Permissions::CONNECT,
+            kind: serenity::PermissionOverwriteType::Role(everyone_role_id),
+        });
+        info!(
+            "  {} -> @everyone = deny (VIEW_CHANNEL, CONNECT)",
+            channel_name
+        );
+
+        // Get permission definitions from config
+        let config = self.config_manager.read().await;
+        let permission_definitions = config
+            .get_global_permissions()
+            .map(|p| p.definitions.clone())
+            .unwrap_or_default();
+        drop(config);
+
+        // Build a GlobalStructureConfig with the loaded permission definitions
+        let global_config = GlobalStructureConfig {
+            permission_definitions,
+            ..Default::default()
+        };
+
+        for (role_name, level) in role_permissions {
+            match role_manager.get_role_id(http, guild_id, role_name).await {
+                Ok(role_id) => {
+                    let (allow, deny) = level.to_permissions(channel_type, &global_config);
+                    overwrites.push(serenity::PermissionOverwrite {
+                        allow,
+                        deny,
+                        kind: serenity::PermissionOverwriteType::Role(role_id),
+                    });
+
+                    let level_str = format!("{:?}", level).to_lowercase();
+                    info!(
+                        "  {} -> {} = {} (allow: {:?}, deny: {:?})",
+                        channel_name, role_name, level_str, allow, deny
+                    );
+                    summary.permissions_applied.push((
+                        channel_name.to_string(),
+                        role_name.clone(),
+                        level_str,
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not find role '{}' for channel '{}': {}",
+                        role_name, channel_name, e
+                    );
+                    if !summary.missing_roles.contains(role_name) {
+                        summary.missing_roles.push(role_name.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(overwrites)
     }
 }
 

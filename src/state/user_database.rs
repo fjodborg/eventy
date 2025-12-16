@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Database tracking all verified users
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserDatabase {
     /// Schema version for migrations
     pub version: u32,
@@ -187,6 +188,7 @@ impl UserDatabase {
 
 /// A tracked user in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrackedUser {
     /// Discord user ID (snowflake as string)
     pub discord_id: String,

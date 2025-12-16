@@ -16,7 +16,7 @@ pub async fn get_config(ctx: Context<'_>) -> Result<(), Error> {
         .iter()
         .map(|s| s.season_id.clone())
         .collect();
-    let has_global = config_manager.get_global_structure().is_some();
+    let has_global = config_manager.get_global_roles().is_some();
     drop(config_manager);
 
     // Build buttons for main categories
@@ -148,7 +148,7 @@ pub async fn get_config(ctx: Context<'_>) -> Result<(), Error> {
                 .iter()
                 .map(|s| s.season_id.clone())
                 .collect();
-            let has_global = config_manager.get_global_structure().is_some();
+            let has_global = config_manager.get_global_roles().is_some();
             drop(config_manager);
 
             let mut buttons = Vec::new();
@@ -545,10 +545,10 @@ async fn handle_commit_or_cancel(
                     }
                 }
 
-                // Check global.json
-                if config_manager.get_global_structure().is_none() {
-                    missing_files_info.push_str("⚠️ Missing: `global.json`\n");
-                    next_steps.push("Upload global.json with `/set_config_global` to define roles".to_string());
+                // Check global roles
+                if config_manager.get_global_roles().is_none() {
+                    missing_files_info.push_str("⚠️ Missing: `global/roles.json`\n");
+                    next_steps.push("Create global/roles.json to define roles".to_string());
                 }
 
                 let mut description = format!("**Changes applied:**\n{}", change_summary);

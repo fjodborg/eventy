@@ -12,7 +12,7 @@ use axum::{
         sse::{Event, Sse},
         Html, IntoResponse, Redirect, Response,
     },
-    routing::{get, post},
+    routing::get,
     Form, Router,
 };
 use serde::Deserialize;
@@ -25,19 +25,21 @@ use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
 use super::auth::{
-    access_denied_page, admin_oauth_url, check_admin_permissions, create_logout_cookie,
+    access_denied_page, admin_oauth_url, check_admin_permissions_with_config, create_logout_cookie,
     create_session_cookie, get_session_token, login_page, AdminCallbackParams, AdminSession,
     SharedSessionStore,
 };
 use super::oauth::OAuthState;
 use crate::logging::SharedLogBuffer;
-use crate::managers::SharedConfigManager;
+use crate::managers::{SharedConfigManager, SharedChannelManager, SharedRoleManager};
 
 /// Extended app state for admin panel
 #[derive(Clone)]
 pub struct AdminState {
     pub oauth: OAuthState,
     pub config_manager: SharedConfigManager,
+    pub channel_manager: SharedChannelManager,
+    pub role_manager: SharedRoleManager,
     pub session_store: SharedSessionStore,
     pub log_buffer: SharedLogBuffer,
     pub serenity_http: Arc<serenity::Http>,
@@ -58,6 +60,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/new-season", get(new_season_form).post(create_season))
         .route("/logs", get(logs_page))
         .route("/logs/stream", get(logs_stream))
+        .route("/restart", axum::routing::post(restart_bot))
+        .route("/sync/roles", axum::routing::post(sync_roles))
+        .route("/sync/assignments", axum::routing::post(sync_assignments))
+        .route("/sync/season/:id", axum::routing::post(sync_season))
         .with_state(state)
 }
 
@@ -216,9 +222,14 @@ async fn oauth_callback(
         )
     });
 
-    // Check if user has admin permissions
+    // Check if user has admin permissions (including special roles from assignments.json)
     let user_id = UserId::new(discord_id.parse().unwrap_or(0));
-    let is_admin = check_admin_permissions(&state.serenity_http, state.guild_id, user_id).await;
+    let is_admin = check_admin_permissions_with_config(
+        &state.serenity_http,
+        state.guild_id,
+        user_id,
+        Some(&state.config_manager),
+    ).await;
 
     if !is_admin {
         warn!(
@@ -251,7 +262,7 @@ async fn dashboard(
         Err(redirect) => return redirect,
     };
 
-    // Get season info
+    // Get season and global config info
     let config = state.config_manager.read().await;
     let seasons: Vec<_> = config
         .get_seasons()
@@ -261,11 +272,15 @@ async fn dashboard(
                 "<tr><td><a href=\"/admin/season/{}\">{}</a></td><td>{}</td><td>{}</td></tr>",
                 id,
                 id,
-                if season.name.is_empty() { id } else { &season.name },
-                season.users.len()
+                if season.name().is_empty() { id } else { season.name() },
+                season.user_count()
             )
         })
         .collect();
+
+    // Get global config status
+    let roles_count = config.get_global_roles().map(|r| r.roles.len()).unwrap_or(0);
+    let has_permissions = config.get_global_permissions().is_some();
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -368,14 +383,30 @@ async fn dashboard(
     <div class="container">
         <div class="nav-links">
             <a href="/admin">Dashboard</a>
-            <a href="/admin/edit/global">Edit Global Config</a>
             <a href="/admin/new-season">New Season</a>
             <a href="/admin/logs">Logs</a>
+            <form method="POST" action="/admin/restart" style="display:inline;" onsubmit="return confirm('Are you sure you want to restart the bot?');">
+                <button type="submit" style="background:#e74c3c;color:#fff;padding:0.5rem 1rem;border-radius:8px;border:none;cursor:pointer;">Restart Bot</button>
+            </form>
         </div>
         <div class="cards">
             <div class="card">
                 <h2>Seasons</h2>
                 <div class="value">{}</div>
+            </div>
+            <div class="card">
+                <h2>Global Roles</h2>
+                <div class="value">{} defined</div>
+                <div style="margin-top:1rem;display:flex;gap:0.5rem;flex-wrap:wrap;">
+                    <a href="/admin/edit/global?tab=roles" style="background:rgba(255,255,255,0.1);color:#fff;padding:0.4rem 0.8rem;border-radius:6px;text-decoration:none;font-size:0.85rem;">Edit Roles</a>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Permissions</h2>
+                <div class="value">{}</div>
+                <div style="margin-top:1rem;">
+                    <a href="/admin/edit/global?tab=permissions" style="background:rgba(255,255,255,0.1);color:#fff;padding:0.4rem 0.8rem;border-radius:6px;text-decoration:none;font-size:0.85rem;">Edit</a>
+                </div>
             </div>
         </div>
         <h2 style="margin-bottom: 1rem;">Seasons</h2>
@@ -396,6 +427,8 @@ async fn dashboard(
 </html>"#,
         session.username,
         config.get_seasons().len(),
+        roles_count,
+        if has_permissions { "Loaded" } else { "Not loaded" },
         seasons.join("\n")
     );
 
@@ -422,7 +455,7 @@ async fn season_detail(
     Path(season_id): Path<String>,
     State(state): State<AdminState>,
 ) -> impl IntoResponse {
-    let session = match require_auth(&headers, &state).await {
+    let _session = match require_auth(&headers, &state).await {
         Ok(s) => s,
         Err(redirect) => return redirect,
     };
@@ -539,8 +572,10 @@ async fn season_detail(
         </div>
         <div style="margin-bottom: 1.5rem;">
             <a href="/admin/edit/season/{}/users" class="btn btn-primary" style="background:#5865F2;color:#fff;padding:0.5rem 1rem;border-radius:6px;text-decoration:none;margin-right:0.5rem;">Edit users.json</a>
-            <a href="/admin/edit/season/{}/category" class="btn btn-secondary" style="background:rgba(255,255,255,0.1);color:#fff;padding:0.5rem 1rem;border-radius:6px;text-decoration:none;margin-right:0.5rem;">Edit category.json</a>
-            <a href="/admin/edit/season/{}/roles" class="btn btn-secondary" style="background:rgba(255,255,255,0.1);color:#fff;padding:0.5rem 1rem;border-radius:6px;text-decoration:none;">Edit roles.json</a>
+            <a href="/admin/edit/season/{}/season" class="btn btn-secondary" style="background:rgba(255,255,255,0.1);color:#fff;padding:0.5rem 1rem;border-radius:6px;text-decoration:none;margin-right:0.5rem;">Edit season.json</a>
+            <form method="POST" action="/admin/sync/season/{}" style="display:inline;">
+                <button type="submit" style="background:#2ecc71;color:#fff;padding:0.5rem 1rem;border-radius:6px;border:none;cursor:pointer;">Sync Category to Discord</button>
+            </form>
         </div>
         <h3 style="margin-bottom: 1rem;">Users</h3>
         <div class="search">
@@ -573,12 +608,12 @@ async fn season_detail(
 </html>"#,
         season_id,
         season_id,
-        if season.name.is_empty() { &season_id } else { &season.name },
-        season.users.len(),
-        season.active,
+        if season.name().is_empty() { &season_id } else { season.name() },
+        season.user_count(),
+        season.is_active(),
         season_id, // edit users link
-        season_id, // edit category link
-        season_id, // edit roles link
+        season_id, // edit season link
+        season_id, // sync category form
         users_html.join("\n")
     );
 
@@ -590,7 +625,7 @@ async fn logs_page(
     headers: HeaderMap,
     State(state): State<AdminState>,
 ) -> impl IntoResponse {
-    let session = match require_auth(&headers, &state).await {
+    let _session = match require_auth(&headers, &state).await {
         Ok(s) => s,
         Err(redirect) => return redirect,
     };
@@ -973,7 +1008,7 @@ fn editor_css() -> &'static str {
     "#
 }
 
-/// GET /admin/edit/global - Edit global.json
+/// GET /admin/edit/global - Edit global configs
 async fn edit_global(
     headers: HeaderMap,
     State(state): State<AdminState>,
@@ -985,11 +1020,22 @@ async fn edit_global(
     };
 
     let config = state.config_manager.read().await;
+    let data_path = config.get_data_path().to_string();
+    drop(config);
 
-    let content = match config.export_config("global", None) {
-        Ok((_, bytes)) => String::from_utf8_lossy(&bytes).to_string(),
-        Err(_) => "{}".to_string(),
-    };
+    // Load all three global config files
+    let roles_content = tokio::fs::read_to_string(format!("{}/global/roles.json", data_path))
+        .await
+        .unwrap_or_else(|_| r#"{"roles": []}"#.to_string());
+    let assignments_content = tokio::fs::read_to_string(format!("{}/global/assignments.json", data_path))
+        .await
+        .unwrap_or_else(|_| r#"{"discord_usernames_by_role": {}}"#.to_string());
+    let permissions_content = tokio::fs::read_to_string(format!("{}/global/permissions.json", data_path))
+        .await
+        .unwrap_or_else(|_| r#"{"definitions": {}}"#.to_string());
+
+    // Get which tab to show
+    let active_tab = params.get("tab").map(|s| s.as_str()).unwrap_or("roles");
 
     let message = params.get("msg").map(|m| {
         let (class, text) = if m == "saved" {
@@ -1009,7 +1055,37 @@ async fn edit_global(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edit Global Config - Eventy Admin</title>
-    <style>{}</style>
+    <style>
+        {editor_css}
+        .tabs {{
+            display: flex;
+            gap: 0;
+            margin-bottom: 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.2);
+        }}
+        .tab {{
+            padding: 0.75rem 1.5rem;
+            background: transparent;
+            border: none;
+            color: #a0a0a0;
+            cursor: pointer;
+            font-size: 0.9rem;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }}
+        .tab:hover {{ color: #fff; }}
+        .tab.active {{
+            color: #5865F2;
+            border-bottom-color: #5865F2;
+        }}
+        .tab-content {{ display: none; }}
+        .tab-content.active {{ display: block; }}
+        .file-hint {{
+            color: #a0a0a0;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+        }}
+    </style>
 </head>
 <body>
     <nav class="navbar">
@@ -1019,42 +1095,106 @@ async fn edit_global(
     <div class="container">
         <div class="back"><a href="/admin">← Back to Dashboard</a></div>
         <h2>Edit Global Configuration</h2>
-        {}
-        <form method="POST" action="/admin/edit/global">
-            <div class="editor-container">
-                <textarea name="content" id="editor">{}</textarea>
+        {message}
+
+        <div class="tabs">
+            <button class="tab {roles_active}" onclick="showTab('roles')">Roles</button>
+            <button class="tab {assignments_active}" onclick="showTab('assignments')">Assignments</button>
+            <button class="tab {permissions_active}" onclick="showTab('permissions')">Permissions</button>
+        </div>
+
+        <div id="roles-tab" class="tab-content {roles_active}">
+            <p class="file-hint">File: global/roles.json - Defines Discord roles to create</p>
+            <form method="POST" action="/admin/edit/global?file=roles">
+                <div class="editor-container">
+                    <textarea name="content" class="editor">{roles_content}</textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Save Roles</button>
+            </form>
+            <div style="margin-top:1.5rem;padding-top:1.5rem;border-top:1px solid rgba(255,255,255,0.1);">
+                <h3 style="margin-bottom:0.75rem;font-size:1rem;color:#a0a0a0;">Sync to Discord</h3>
+                <p style="margin-bottom:1rem;font-size:0.9rem;color:#808080;">Create or update roles in Discord to match this configuration.</p>
+                <form method="POST" action="/admin/sync/roles" style="display:inline;">
+                    <button type="submit" class="btn" style="background:#2ecc71;color:#fff;">Sync Roles to Discord</button>
+                </form>
             </div>
-            <button type="submit" class="btn btn-primary">Save Changes</button>
-            <a href="/admin" class="btn btn-secondary">Cancel</a>
-        </form>
-        <p class="hint">This file controls global settings like default roles, channels, and permission definitions.</p>
+        </div>
+
+        <div id="assignments-tab" class="tab-content {assignments_active}">
+            <p class="file-hint">File: global/assignments.json - Assigns special roles to Discord users</p>
+            <form method="POST" action="/admin/edit/global?file=assignments">
+                <div class="editor-container">
+                    <textarea name="content" class="editor">{assignments_content}</textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Save Assignments</button>
+            </form>
+            <div style="margin-top:1.5rem;padding-top:1.5rem;border-top:1px solid rgba(255,255,255,0.1);">
+                <h3 style="margin-bottom:0.75rem;font-size:1rem;color:#a0a0a0;">Sync to Discord</h3>
+                <p style="margin-bottom:1rem;font-size:0.9rem;color:#808080;">Assign special roles to all verified users in the server based on this configuration.</p>
+                <form method="POST" action="/admin/sync/assignments" style="display:inline;">
+                    <button type="submit" class="btn" style="background:#2ecc71;color:#fff;">Sync Assignments to Discord</button>
+                </form>
+            </div>
+        </div>
+
+        <div id="permissions-tab" class="tab-content {permissions_active}">
+            <p class="file-hint">File: global/permissions.json - Defines permission levels (read, readwrite, admin)</p>
+            <form method="POST" action="/admin/edit/global?file=permissions">
+                <div class="editor-container">
+                    <textarea name="content" class="editor">{permissions_content}</textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Save Permissions</button>
+            </form>
+        </div>
+
+        <a href="/admin" class="btn btn-secondary" style="margin-top: 1rem;">Back to Dashboard</a>
     </div>
     <script>
-        // Basic JSON validation on input
-        const editor = document.getElementById('editor');
-        editor.addEventListener('input', function() {{
-            try {{
-                JSON.parse(this.value);
-                this.style.borderColor = 'rgba(255,255,255,0.2)';
-            }} catch (e) {{
-                this.style.borderColor = '#e74c3c';
-            }}
+        function showTab(name) {{
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelector(`[onclick="showTab('${{name}}')"]`).classList.add('active');
+            document.getElementById(name + '-tab').classList.add('active');
+        }}
+
+        // JSON validation
+        document.querySelectorAll('.editor').forEach(editor => {{
+            editor.addEventListener('input', function() {{
+                try {{
+                    JSON.parse(this.value);
+                    this.style.borderColor = 'rgba(255,255,255,0.2)';
+                }} catch (e) {{
+                    this.style.borderColor = '#e74c3c';
+                }}
+            }});
         }});
     </script>
 </body>
 </html>"#,
-        editor_css(),
-        message,
-        html_escape(&content)
+        editor_css = editor_css(),
+        message = message,
+        roles_active = if active_tab == "roles" { "active" } else { "" },
+        assignments_active = if active_tab == "assignments" { "active" } else { "" },
+        permissions_active = if active_tab == "permissions" { "active" } else { "" },
+        roles_content = html_escape(&roles_content),
+        assignments_content = html_escape(&assignments_content),
+        permissions_content = html_escape(&permissions_content),
     );
 
     Html(html).into_response()
 }
 
-/// POST /admin/edit/global - Save global.json
+/// Query params for save_global
+#[derive(Deserialize)]
+struct SaveGlobalParams {
+    file: Option<String>,
+}
+
+/// POST /admin/edit/global - Save a global config file
 async fn save_global(
     headers: HeaderMap,
     State(state): State<AdminState>,
+    Query(params): Query<SaveGlobalParams>,
     Form(form): Form<JsonEditorForm>,
 ) -> impl IntoResponse {
     let _session = match require_auth(&headers, &state).await {
@@ -1062,10 +1202,12 @@ async fn save_global(
         Err(redirect) => return redirect,
     };
 
+    let file_type = params.file.as_deref().unwrap_or("roles");
+
     // Validate JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&form.content) {
         let err_msg = format!("error:Invalid JSON: {}", e);
-        return Redirect::to(&format!("/admin/edit/global?msg={}", urlencoding::encode(&err_msg))).into_response();
+        return Redirect::to(&format!("/admin/edit/global?tab={}&msg={}", file_type, urlencoding::encode(&err_msg))).into_response();
     }
 
     // Save to file
@@ -1073,7 +1215,21 @@ async fn save_global(
     let data_path = config.get_data_path().to_string();
     drop(config);
 
-    let file_path = format!("{}/global.json", data_path);
+    let file_path = match file_type {
+        "roles" => format!("{}/global/roles.json", data_path),
+        "assignments" => format!("{}/global/assignments.json", data_path),
+        "permissions" => format!("{}/global/permissions.json", data_path),
+        _ => {
+            let err_msg = "error:Unknown file type";
+            return Redirect::to(&format!("/admin/edit/global?msg={}", urlencoding::encode(err_msg))).into_response();
+        }
+    };
+
+    // Ensure global directory exists
+    let global_dir = format!("{}/global", data_path);
+    if let Err(e) = tokio::fs::create_dir_all(&global_dir).await {
+        warn!("Failed to create global directory: {}", e);
+    }
 
     // Save file with explicit sync to ensure data is flushed to disk
     match tokio::fs::File::create(&file_path).await {
@@ -1082,7 +1238,7 @@ async fn save_global(
             let mut file = file;
             if let Err(e) = file.write_all(form.content.as_bytes()).await {
                 let err_msg = format!("error:Failed to write: {}", e);
-                return Redirect::to(&format!("/admin/edit/global?msg={}", urlencoding::encode(&err_msg))).into_response();
+                return Redirect::to(&format!("/admin/edit/global?tab={}&msg={}", file_type, urlencoding::encode(&err_msg))).into_response();
             }
             // Sync to disk to prevent race condition with reload
             if let Err(e) = file.sync_all().await {
@@ -1091,7 +1247,7 @@ async fn save_global(
         }
         Err(e) => {
             let err_msg = format!("error:Failed to save: {}", e);
-            return Redirect::to(&format!("/admin/edit/global?msg={}", urlencoding::encode(&err_msg))).into_response();
+            return Redirect::to(&format!("/admin/edit/global?tab={}&msg={}", file_type, urlencoding::encode(&err_msg))).into_response();
         }
     }
 
@@ -1101,8 +1257,8 @@ async fn save_global(
         warn!("Failed to reload config after save: {}", e);
     }
 
-    info!("Global config saved via admin panel");
-    Redirect::to("/admin/edit/global?msg=saved").into_response()
+    info!("Global config ({}) saved via admin panel", file_type);
+    Redirect::to(&format!("/admin/edit/global?tab={}&msg=saved", file_type)).into_response()
 }
 
 /// Season file path parameters
@@ -1126,25 +1282,12 @@ async fn edit_season_file(
 
     let config = state.config_manager.read().await;
     let data_path = config.get_data_path().to_string();
+    drop(config);
 
     // Determine which file to load
-    let (file_path, config_type, description) = match params.file.as_str() {
-        "users" | "users.json" => (
-            format!("{}/seasons/{}/users.json", data_path, params.id),
-            "users",
-            "User list with verification IDs"
-        ),
-        "category" | "category.json" => (
-            format!("{}/seasons/{}/category.json", data_path, params.id),
-            "category",
-            "Category and channel structure"
-        ),
-        "roles" | "roles.json" => (
-            format!("{}/seasons/{}/roles.json", data_path, params.id),
-            "roles",
-            "Special role assignments"
-        ),
-        _ => {
+    let file_type = match get_season_file_type(&params.file) {
+        Some(ft) => ft,
+        None => {
             return Html(format!(
                 r#"<!DOCTYPE html><html><head><title>Not Found</title></head>
                 <body style="background:#1a1a2e;color:#fff;font-family:sans-serif;padding:2rem;">
@@ -1155,31 +1298,15 @@ async fn edit_season_file(
             )).into_response();
         }
     };
-    drop(config);
 
-    // Read file content
-    let content = match tokio::fs::read_to_string(&file_path).await {
-        Ok(c) => c,
-        Err(_) => {
-            // File doesn't exist, provide template
-            match config_type {
-                "users" => format!(r#"{{
-  "season_id": "{}",
-  "name": "",
-  "active": true,
-  "users": []
-}}"#, params.id),
-                "category" => r#"{
-  "category_name": "Season Category",
-  "channels": []
-}"#.to_string(),
-                "roles" => r#"{
-  "roles": {}
-}"#.to_string(),
-                _ => "{}".to_string(),
-            }
-        }
-    };
+    let file_path = format!("{}/seasons/{}/{}", data_path, params.id, file_type.file_name);
+    let config_type = file_type.name;
+    let description = file_type.description;
+
+    // Read file content or use template
+    let content = tokio::fs::read_to_string(&file_path)
+        .await
+        .unwrap_or_else(|_| get_season_file_template(config_type, &params.id));
 
     let message = query.get("msg").map(|m| {
         let (class, text) = if m == "saved" {
@@ -1271,17 +1398,15 @@ async fn save_season_file(
     drop(config);
 
     // Determine file path
-    let file_name = match params.file.as_str() {
-        "users" | "users.json" => "users.json",
-        "category" | "category.json" => "category.json",
-        "roles" | "roles.json" => "roles.json",
-        _ => {
+    let file_type = match get_season_file_type(&params.file) {
+        Some(ft) => ft,
+        None => {
             return Redirect::to(&format!("{}?msg={}", redirect_url, urlencoding::encode("error:Unknown file type"))).into_response();
         }
     };
 
     let dir_path = format!("{}/seasons/{}", data_path, params.id);
-    let file_path = format!("{}/{}", dir_path, file_name);
+    let file_path = format!("{}/{}", dir_path, file_type.file_name);
 
     // Ensure directory exists
     if let Err(e) = tokio::fs::create_dir_all(&dir_path).await {
@@ -1315,7 +1440,7 @@ async fn save_season_file(
         warn!("Failed to reload config after save: {}", e);
     }
 
-    info!("Season {} {} saved via admin panel", params.id, file_name);
+    info!("Season {} {} saved via admin panel", params.id, file_type.file_name);
     Redirect::to(&format!("{}?msg=saved", redirect_url)).into_response()
 }
 
@@ -1385,7 +1510,7 @@ async fn new_season_form(
     Html(html).into_response()
 }
 
-/// POST /admin/new-season - Create a new season
+/// POST /admin/new-season - Create a new season by copying from template
 async fn create_season(
     headers: HeaderMap,
     State(state): State<AdminState>,
@@ -1408,6 +1533,12 @@ async fn create_season(
         return Redirect::to(&format!("/admin/new-season?msg={}", msg)).into_response();
     }
 
+    // Don't allow creating a season called "template"
+    if season_id.eq_ignore_ascii_case("template") {
+        let msg = urlencoding::encode("error:Cannot create a season named 'template'");
+        return Redirect::to(&format!("/admin/new-season?msg={}", msg)).into_response();
+    }
+
     let config = state.config_manager.read().await;
     let data_path = config.get_data_path().to_string();
 
@@ -1417,25 +1548,80 @@ async fn create_season(
     }
     drop(config);
 
-    // Create season directory
+    let template_dir = format!("{}/seasons/template", data_path);
     let season_dir = format!("{}/seasons/{}", data_path, season_id);
+
+    // Create season directory
     if let Err(e) = tokio::fs::create_dir_all(&season_dir).await {
         let err_msg = format!("error:Failed to create directory: {}", e);
         return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
     }
 
-    // Create default users.json with correct SeasonConfig structure
-    let users_content = serde_json::json!({
-        "season_id": season_id,
-        "name": form.name.trim(),
-        "active": true,
-        "users": []
-    });
+    // Copy and modify template files
+    let files_to_copy = ["users.json", "category.json", "roles.json"];
+    for filename in files_to_copy {
+        let template_path = format!("{}/{}", template_dir, filename);
+        let dest_path = format!("{}/{}", season_dir, filename);
 
-    let users_path = format!("{}/users.json", season_dir);
-    if let Err(e) = tokio::fs::write(&users_path, serde_json::to_string_pretty(&users_content).unwrap()).await {
-        let err_msg = format!("error:Failed to create users.json: {}", e);
-        return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
+        // Read template file
+        let content = match tokio::fs::read_to_string(&template_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Template file {} not found, skipping: {}", filename, e);
+                continue;
+            }
+        };
+
+        // Parse and modify JSON to replace TEMPLATE with actual season ID
+        let modified_content = match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(mut json) => {
+                // Replace season_id field if present
+                if let Some(obj) = json.as_object_mut() {
+                    if obj.contains_key("season_id") {
+                        obj.insert("season_id".to_string(), serde_json::json!(season_id));
+                    }
+                    // For users.json: update name and set active to true, clear users
+                    if filename == "users.json" {
+                        obj.insert("name".to_string(), serde_json::json!(form.name.trim()));
+                        obj.insert("active".to_string(), serde_json::json!(true));
+                        obj.insert("users".to_string(), serde_json::json!([]));
+                    }
+                    // For category.json: update category_name
+                    if filename == "category.json" {
+                        if let Some(name) = form.name.trim().chars().next() {
+                            // Only set if name is non-empty
+                            if !form.name.trim().is_empty() {
+                                obj.insert("category_name".to_string(), serde_json::json!(form.name.trim()));
+                            } else {
+                                obj.insert("category_name".to_string(), serde_json::json!(season_id));
+                            }
+                            let _ = name; // silence warning
+                        }
+                    }
+                }
+                serde_json::to_string_pretty(&json).unwrap_or(content)
+            }
+            Err(_) => content, // If JSON parse fails, copy as-is
+        };
+
+        // Write modified content
+        match tokio::fs::File::create(&dest_path).await {
+            Ok(file) => {
+                use tokio::io::AsyncWriteExt;
+                let mut file = file;
+                if let Err(e) = file.write_all(modified_content.as_bytes()).await {
+                    let err_msg = format!("error:Failed to write {}: {}", filename, e);
+                    return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
+                }
+                if let Err(e) = file.sync_all().await {
+                    warn!("Failed to sync {} to disk: {}", filename, e);
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("error:Failed to create {}: {}", filename, e);
+                return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
+            }
+        }
     }
 
     // Reload config
@@ -1444,6 +1630,685 @@ async fn create_season(
         warn!("Failed to reload config after creating season: {}", e);
     }
 
-    info!("Season {} created via admin panel", season_id);
+    info!("Season {} created from template via admin panel", season_id);
     Redirect::to(&format!("/admin/season/{}", season_id)).into_response()
+}
+
+/// POST /admin/restart - Restart the bot
+async fn restart_bot(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    let session = match require_auth(&headers, &state).await {
+        Ok(s) => s,
+        Err(redirect) => return redirect,
+    };
+
+    warn!(
+        "Bot restart initiated by {} ({}) via admin panel",
+        session.username, session.discord_id
+    );
+
+    // Return a page that shows restart message, then exit
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Restarting - Eventy Admin</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            color: #fff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .container {
+            text-align: center;
+            background: rgba(255,255,255,0.05);
+            padding: 3rem;
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        h1 { margin-bottom: 1rem; }
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255,255,255,0.1);
+            border-top-color: #5865F2;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 1.5rem auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        p { color: #a0a0a0; }
+    </style>
+    <script>
+        // Try to reconnect after a delay
+        setTimeout(function() {
+            window.location.href = '/admin';
+        }, 5000);
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Restarting Bot...</h1>
+        <div class="spinner"></div>
+        <p>The bot is restarting. You will be redirected automatically.</p>
+        <p style="margin-top: 1rem; font-size: 0.85rem;">If not redirected, <a href="/admin" style="color:#5865F2;">click here</a>.</p>
+    </div>
+</body>
+</html>"#;
+
+    // Spawn a task to exit after response is sent
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::process::exit(0);
+    });
+
+    Html(html).into_response()
+}
+
+/// Handle a role operation error and return a user-friendly message
+fn handle_role_error(role_name: &str, error: &serenity::Error) -> String {
+    let err_str = error.to_string();
+
+    if err_str.contains("Missing Permissions") || err_str.contains("50013") {
+        let msg = format!("{}: Role hierarchy issue - move bot's role above '{}' in Discord server settings", role_name, role_name);
+        error!("{}", msg);
+        msg
+    } else {
+        error!("Failed to sync role '{}': {}", role_name, error);
+        format!("{}: {}", role_name, error)
+    }
+}
+
+/// Season file type configuration
+struct SeasonFileType {
+    name: &'static str,        // e.g., "users"
+    file_name: &'static str,   // e.g., "users.json"
+    description: &'static str,
+}
+
+/// Get file configuration for a season file type
+fn get_season_file_type(file_type: &str) -> Option<SeasonFileType> {
+    match file_type {
+        "users" | "users.json" => Some(SeasonFileType {
+            name: "users",
+            file_name: "users.json",
+            description: "User list with verification IDs",
+        }),
+        "season" | "season.json" => Some(SeasonFileType {
+            name: "season",
+            file_name: "season.json",
+            description: "Season configuration (name, active, channels)",
+        }),
+        "category" | "category.json" => Some(SeasonFileType {
+            name: "category",
+            file_name: "category.json",
+            description: "Category and channel structure",
+        }),
+        "roles" | "roles.json" => Some(SeasonFileType {
+            name: "roles",
+            file_name: "roles.json",
+            description: "Special role assignments",
+        }),
+        _ => None,
+    }
+}
+
+/// Get default template content for a season file type
+fn get_season_file_template(file_type: &str, season_id: &str) -> String {
+    match file_type {
+        "users" | "users.json" => "[]".to_string(),
+        "season" | "season.json" => format!(r#"{{
+  "name": "{}",
+  "active": true,
+  "channels": []
+}}"#, season_id),
+        "category" | "category.json" => r#"{
+  "category_name": "Season Category",
+  "channels": []
+}"#.to_string(),
+        "roles" | "roles.json" => r#"{
+  "roles": {}
+}"#.to_string(),
+        _ => "{}".to_string(),
+    }
+}
+
+/// POST /admin/sync/roles - Sync roles to Discord
+async fn sync_roles(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    // Diagnostic logging - this should always appear
+    eprintln!("[SYNC_ROLES] Handler called - starting role sync");
+    info!("=== SYNC ROLES STARTED ===");
+
+    let _session = match require_auth(&headers, &state).await {
+        Ok(s) => {
+            info!("sync_roles: authenticated as {}", s.username);
+            s
+        }
+        Err(redirect) => {
+            warn!("sync_roles: authentication failed");
+            return redirect;
+        }
+    };
+
+    info!("sync_roles: loading config...");
+    let config = state.config_manager.read().await;
+    let global_roles = match config.get_global_roles() {
+        Some(r) => {
+            info!("sync_roles: found {} roles in config", r.roles.len());
+            r.clone()
+        }
+        None => {
+            warn!("sync_roles: no global roles configured");
+            return Html(sync_result_page(
+                "Sync Roles",
+                false,
+                "No global roles configured. Add roles to `data/global/roles.json`.",
+                "/admin",
+            )).into_response();
+        }
+    };
+    drop(config);
+
+    let http = state.serenity_http.as_ref();
+    let guild_id = state.guild_id;
+    info!("sync_roles: using guild_id {}", guild_id);
+
+    // Get existing roles
+    info!("sync_roles: fetching existing roles from Discord...");
+    let existing_roles = match guild_id.roles(http).await {
+        Ok(r) => {
+            info!("sync_roles: Discord has {} existing roles", r.len());
+            r
+        }
+        Err(e) => {
+            error!("sync_roles: failed to fetch roles from Discord: {}", e);
+            return Html(sync_result_page(
+                "Sync Roles",
+                false,
+                &format!("Failed to fetch roles from Discord: {}", e),
+                "/admin",
+            )).into_response();
+        }
+    };
+
+    let mut created = Vec::new();
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut errors = Vec::new();
+
+    for role_def in &global_roles.roles {
+        if let Some((role_id, existing_role)) = existing_roles.iter().find(|(_, r)| r.name == role_def.name) {
+            let target_color = role_def
+                .color
+                .as_ref()
+                .and_then(|c| {
+                    let hex = c.trim_start_matches('#');
+                    u32::from_str_radix(hex, 16).ok()
+                })
+                .unwrap_or(0);
+
+            let needs_update = existing_role.colour.0 != target_color
+                || existing_role.hoist != role_def.hoist
+                || existing_role.mentionable != role_def.mentionable;
+
+            if needs_update {
+                match guild_id
+                    .edit_role(
+                        http,
+                        *role_id,
+                        serenity::EditRole::new()
+                            .colour(target_color as u64)
+                            .hoist(role_def.hoist)
+                            .mentionable(role_def.mentionable),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Updated role '{}' via admin panel", role_def.name);
+                        updated.push(role_def.name.clone());
+                    }
+                    Err(e) => {
+                        errors.push(handle_role_error(&role_def.name, &e));
+                    }
+                }
+            } else {
+                unchanged.push(role_def.name.clone());
+            }
+        } else {
+            // Create new role
+            let color = role_def
+                .color
+                .as_ref()
+                .and_then(|c| {
+                    let hex = c.trim_start_matches('#');
+                    u32::from_str_radix(hex, 16).ok().map(serenity::Colour::new)
+                })
+                .unwrap_or(serenity::Colour::default());
+
+            match guild_id
+                .create_role(
+                    http,
+                    serenity::EditRole::new()
+                        .name(&role_def.name)
+                        .colour(color)
+                        .hoist(role_def.hoist)
+                        .mentionable(role_def.mentionable),
+                )
+                .await
+            {
+                Ok(role) => {
+                    info!("Created role '{}' (ID: {}) via admin panel", role_def.name, role.id);
+                    created.push(role_def.name.clone());
+                }
+                Err(e) => {
+                    errors.push(handle_role_error(&role_def.name, &e));
+                }
+            }
+        }
+    }
+
+    // Build result message
+    let mut message = String::new();
+    if !created.is_empty() {
+        message.push_str(&format!("<p><strong>Created ({}):</strong> {}</p>", created.len(), created.join(", ")));
+    }
+    if !updated.is_empty() {
+        message.push_str(&format!("<p><strong>Updated ({}):</strong> {}</p>", updated.len(), updated.join(", ")));
+    }
+    if !unchanged.is_empty() {
+        message.push_str(&format!("<p><strong>Unchanged ({}):</strong> {}</p>", unchanged.len(), unchanged.join(", ")));
+    }
+    if !errors.is_empty() {
+        message.push_str(&format!("<p style=\"color:#e74c3c;\"><strong>Errors ({}):</strong> {}</p>", errors.len(), errors.join(", ")));
+    }
+    if message.is_empty() {
+        message = String::from("<p>No roles to sync.</p>");
+    }
+
+    Html(sync_result_page(
+        "Sync Roles",
+        errors.is_empty(),
+        &message,
+        "/admin",
+    )).into_response()
+}
+
+/// POST /admin/sync/assignments - Sync role assignments to all verified Discord members
+async fn sync_assignments(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    info!("=== SYNC ASSIGNMENTS STARTED ===");
+
+    let _session = match require_auth(&headers, &state).await {
+        Ok(s) => {
+            info!("sync_assignments: authenticated as {}", s.username);
+            s
+        }
+        Err(redirect) => {
+            warn!("sync_assignments: authentication failed");
+            return redirect;
+        }
+    };
+
+    // Load assignments config
+    let config = state.config_manager.read().await;
+    let special_members = match config.get_special_members() {
+        Some(sm) => sm.clone(),
+        None => {
+            warn!("sync_assignments: no special members configured");
+            return Html(sync_result_page(
+                "Sync Assignments",
+                false,
+                "No assignments configured. Add role assignments to `data/global/assignments.json`.",
+                "/admin/edit/global?tab=assignments",
+            )).into_response();
+        }
+    };
+    drop(config);
+
+    let http = state.serenity_http.as_ref();
+    let guild_id = state.guild_id;
+
+    // Get all members in the guild
+    info!("sync_assignments: fetching guild members...");
+    let members = match guild_id.members(http, None, None).await {
+        Ok(m) => {
+            info!("sync_assignments: fetched {} members", m.len());
+            m
+        }
+        Err(e) => {
+            error!("sync_assignments: failed to fetch guild members: {}", e);
+            return Html(sync_result_page(
+                "Sync Assignments",
+                false,
+                &format!("Failed to fetch guild members: {}", e),
+                "/admin/edit/global?tab=assignments",
+            )).into_response();
+        }
+    };
+
+    // Get all managed role names (roles in assignments.json)
+    let all_assignment_roles = special_members.get_all_role_names();
+    info!("sync_assignments: managed roles: {:?}", all_assignment_roles);
+
+    let role_manager = state.role_manager.read().await;
+
+    // Pre-build a map of role_name -> role_id for all managed roles
+    let mut managed_role_ids = std::collections::HashMap::new();
+    for role_name in &all_assignment_roles {
+        if let Ok(role_id) = role_manager.get_role_id(http, guild_id, role_name).await {
+            managed_role_ids.insert(role_name.clone(), role_id);
+        }
+    }
+
+    let mut total_added = Vec::new();
+    let mut total_removed = Vec::new();
+    let mut total_failed = Vec::new();
+    let mut users_processed = 0;
+
+    for member in &members {
+        let discord_username = &member.user.name;
+        let user_id = member.user.id;
+
+        // Get special roles for this user (what they SHOULD have)
+        let desired_roles = special_members.get_roles_for_user(discord_username);
+
+        // Process ALL members who either have or should have assignment roles
+        // This ensures we remove roles from users who were removed from assignments.json
+        let has_any_managed_role = managed_role_ids.values().any(|role_id| {
+            member.roles.contains(role_id)
+        });
+
+        if desired_roles.is_empty() && !has_any_managed_role {
+            continue; // Skip users with no special roles and no managed roles
+        }
+
+        users_processed += 1;
+        info!(
+            "sync_assignments: processing user '{}' ({}) - desired: {:?}",
+            discord_username,
+            user_id,
+            desired_roles
+        );
+
+        let (added, removed, failed) = role_manager
+            .full_sync_assignments_for_user(
+                http,
+                guild_id,
+                user_id,
+                discord_username,
+                &desired_roles,
+                &all_assignment_roles,
+            )
+            .await;
+
+        for role in added {
+            total_added.push(format!("{} +{}", discord_username, role));
+        }
+        for role in removed {
+            total_removed.push(format!("{} -{}", discord_username, role));
+        }
+        for err in failed {
+            total_failed.push(format!("{}: {}", discord_username, err));
+        }
+    }
+
+    drop(role_manager);
+
+    // Build result message
+    let mut message = format!("<p><strong>Users processed:</strong> {}</p>", users_processed);
+
+    if !total_added.is_empty() {
+        message.push_str(&format!(
+            "<p><strong>Roles added ({}):</strong></p><ul>{}</ul>",
+            total_added.len(),
+            total_added.iter().map(|r| format!("<li>{}</li>", html_escape(r))).collect::<Vec<_>>().join("")
+        ));
+    }
+
+    if !total_removed.is_empty() {
+        message.push_str(&format!(
+            "<p><strong>Roles removed ({}):</strong></p><ul>{}</ul>",
+            total_removed.len(),
+            total_removed.iter().map(|r| format!("<li>{}</li>", html_escape(r))).collect::<Vec<_>>().join("")
+        ));
+    }
+
+    if !total_failed.is_empty() {
+        message.push_str(&format!(
+            "<p style=\"color:#e74c3c;\"><strong>Failed ({}):</strong></p><ul>{}</ul>",
+            total_failed.len(),
+            total_failed.iter().map(|r| format!("<li>{}</li>", html_escape(r))).collect::<Vec<_>>().join("")
+        ));
+    }
+
+    if total_added.is_empty() && total_removed.is_empty() && total_failed.is_empty() && users_processed > 0 {
+        message.push_str("<p>All users already have the correct roles.</p>");
+    } else if users_processed == 0 {
+        message.push_str("<p>No changes needed.</p>");
+    }
+
+    info!(
+        "sync_assignments: completed - {} added, {} removed, {} failed",
+        total_added.len(),
+        total_removed.len(),
+        total_failed.len()
+    );
+
+    Html(sync_result_page(
+        "Sync Assignments",
+        total_failed.is_empty(),
+        &message,
+        "/admin/edit/global?tab=assignments",
+    )).into_response()
+}
+
+/// POST /admin/sync/season/:id - Sync season category to Discord
+async fn sync_season(
+    headers: HeaderMap,
+    Path(season_id): Path<String>,
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    info!("=== SYNC SEASON STARTED for '{}' ===", season_id);
+
+    let _session = match require_auth(&headers, &state).await {
+        Ok(s) => {
+            info!("sync_season: authenticated as {}", s.username);
+            s
+        }
+        Err(redirect) => {
+            warn!("sync_season: authentication failed");
+            return redirect;
+        }
+    };
+
+    // Load season config
+    let config = state.config_manager.read().await;
+    let season = match config.get_season(&season_id) {
+        Some(s) => {
+            info!("sync_season: found season '{}' with {} channels", season_id, s.channels().len());
+            s.clone()
+        }
+        None => {
+            warn!("sync_season: season '{}' not found", season_id);
+            return Html(sync_result_page(
+                &format!("Sync Season {}", season_id),
+                false,
+                &format!("Season '{}' not found.", season_id),
+                &format!("/admin/season/{}", season_id),
+            )).into_response();
+        }
+    };
+    drop(config);
+
+    if season.channels().is_empty() {
+        return Html(sync_result_page(
+            &format!("Sync Season {}", season_id),
+            false,
+            &format!("Season '{}' has no channels defined in season.json.", season_id),
+            &format!("/admin/season/{}", season_id),
+        )).into_response();
+    }
+
+    let http = state.serenity_http.as_ref();
+    let guild_id = state.guild_id;
+    let category_name = season.name().to_string();
+    let channels = season.channels().to_vec();
+
+    // Use channel_manager to sync
+    let channel_manager = state.channel_manager.read().await;
+    let summary = match channel_manager.sync_season_channels(http, guild_id, &category_name, &channels).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to sync season '{}': {}", season_id, e);
+            return Html(sync_result_page(
+                &format!("Sync Season {}", season_id),
+                false,
+                &format!("Failed to sync season: {}", e),
+                &format!("/admin/season/{}", season_id),
+            )).into_response();
+        }
+    };
+    drop(channel_manager);
+
+    // Build result message from summary
+    let mut message = String::new();
+
+    if let Some(cat) = &summary.category_created {
+        message.push_str(&format!("<p><strong>Category created:</strong> {}</p>", cat));
+    } else if let Some(cat) = &summary.category_existing {
+        message.push_str(&format!("<p><strong>Category:</strong> {}</p>", cat));
+    }
+
+    if !summary.channels_created.is_empty() {
+        message.push_str(&format!("<p><strong>Channels created ({}):</strong> {}</p>",
+            summary.channels_created.len(),
+            summary.channels_created.iter().map(|c| format!("#{}", c)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    if !summary.channels_updated.is_empty() {
+        message.push_str(&format!("<p><strong>Channels updated ({}):</strong> {}</p>",
+            summary.channels_updated.len(),
+            summary.channels_updated.iter().map(|c| format!("#{}", c)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let has_missing_roles = !summary.missing_roles.is_empty();
+    if has_missing_roles {
+        warn!("Missing roles for season '{}': {}", season_id, summary.missing_roles.join(", "));
+        message.push_str(&format!(
+            "<p style=\"color:#f39c12;\"><strong>Warning:</strong> The following roles were not found and permissions were not set: {}</p>",
+            summary.missing_roles.join(", ")
+        ));
+        message.push_str("<p style=\"color:#a0a0a0;font-size:0.9rem;\">Make sure to sync roles first, or check that role names match exactly.</p>");
+    }
+
+    if !summary.warnings.is_empty() {
+        for warning in &summary.warnings {
+            message.push_str(&format!("<p style=\"color:#f39c12;\">{}</p>", warning));
+        }
+    }
+
+    let success = summary.warnings.is_empty() && !has_missing_roles;
+    Html(sync_result_page(
+        &format!("Sync Season {}", season_id),
+        success,
+        &message,
+        &format!("/admin/season/{}", season_id),
+    )).into_response()
+}
+
+/// Generate a sync result page
+fn sync_result_page(title: &str, success: bool, message: &str, back_url: &str) -> String {
+    let status_color = if success { "#2ecc71" } else { "#e74c3c" };
+    let status_text = if success { "Success" } else { "Error" };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{} - Eventy Admin</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            color: #fff;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }}
+        .container {{
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 2rem;
+            max-width: 600px;
+            width: 90%;
+            border: 1px solid rgba(255,255,255,0.1);
+        }}
+        h1 {{
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        .status {{
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            background: {};
+        }}
+        .message {{
+            margin: 1.5rem 0;
+            line-height: 1.6;
+        }}
+        .message p {{
+            margin-bottom: 0.5rem;
+        }}
+        .back {{
+            display: inline-block;
+            padding: 0.75rem 1.5rem;
+            background: #5865F2;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 8px;
+        }}
+        .back:hover {{
+            background: #4752c4;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{} <span class="status">{}</span></h1>
+        <div class="message">{}</div>
+        <a href="{}" class="back">Back</a>
+    </div>
+</body>
+</html>"#,
+        title,
+        status_color,
+        title,
+        status_text,
+        message,
+        back_url
+    )
 }

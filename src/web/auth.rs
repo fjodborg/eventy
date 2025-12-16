@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use super::oauth::OAuthState;
+use crate::managers::SharedConfigManager;
 
 /// Session data for authenticated admin
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,14 +109,42 @@ pub struct AdminCallbackParams {
 }
 
 /// Check if a user has admin permissions in the configured guild
+/// Returns true if user:
+/// - Has ADMINISTRATOR permission in the guild
+/// - Is the guild owner
+/// - Is listed in the "maintainers" array in assignments.json
 pub async fn check_admin_permissions(
     http: &serenity::Http,
     guild_id: GuildId,
     user_id: serenity::UserId,
 ) -> bool {
+    check_admin_permissions_with_config(http, guild_id, user_id, None).await
+}
+
+/// Check if a user has admin permissions, also checking maintainers list from config
+pub async fn check_admin_permissions_with_config(
+    http: &serenity::Http,
+    guild_id: GuildId,
+    user_id: serenity::UserId,
+    config_manager: Option<&SharedConfigManager>,
+) -> bool {
     // Try to get the member
     match http.get_member(guild_id, user_id).await {
         Ok(member) => {
+            let username = &member.user.name;
+
+            // Check if user is in the maintainers list in assignments.json
+            if let Some(config_manager) = config_manager {
+                let config = config_manager.read().await;
+                if config.is_maintainer(username) {
+                    info!(
+                        "User '{}' ({}) granted admin access via maintainers list",
+                        username, user_id
+                    );
+                    return true;
+                }
+            }
+
             // Get the guild to check permissions
             match http.get_guild(guild_id).await {
                 Ok(guild) => {
@@ -123,6 +152,10 @@ pub async fn check_admin_permissions(
                     for role_id in &member.roles {
                         if let Some(role) = guild.roles.get(role_id) {
                             if role.permissions.contains(Permissions::ADMINISTRATOR) {
+                                info!(
+                                    "User '{}' ({}) granted admin access via ADMINISTRATOR permission",
+                                    username, user_id
+                                );
                                 return true;
                             }
                         }
@@ -130,9 +163,17 @@ pub async fn check_admin_permissions(
 
                     // Check if user is the guild owner
                     if guild.owner_id == user_id {
+                        info!(
+                            "User '{}' ({}) granted admin access as guild owner",
+                            username, user_id
+                        );
                         return true;
                     }
 
+                    warn!(
+                        "User '{}' ({}) denied admin access - no ADMINISTRATOR permission and not in maintainers list",
+                        username, user_id
+                    );
                     false
                 }
                 Err(e) => {
@@ -268,7 +309,7 @@ pub fn login_page(oauth_url: &str) -> String {
             </svg>
             Login with Discord
         </a>
-        <p class="note">You must have Administrator permissions in the server to access this panel.</p>
+        <p class="note">You must have Administrator permissions or be in the maintainers list to access this panel.</p>
     </div>
 </body>
 </html>"#,
@@ -317,7 +358,8 @@ pub fn access_denied_page() -> String {
 <body>
     <div class="container">
         <h1>Access Denied</h1>
-        <p>You do not have Administrator permissions in this server.</p>
+        <p>You do not have permission to access the admin panel.</p>
+        <p>Access requires either Discord ADMINISTRATOR permission or being listed in the "maintainers" array in assignments.json.</p>
         <p>Please contact a server administrator if you believe this is an error.</p>
         <p><a href="/admin/login">Try logging in again</a></p>
     </div>

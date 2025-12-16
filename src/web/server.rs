@@ -1,33 +1,76 @@
 //! Web server implementation for OAuth verification
 
 use axum::{
-    extract::{Path, Query, State},
-    response::Html,
+    extract::{Host, Path, Query, State},
+    handler::HandlerWithoutStateExt,
+    http::{StatusCode, Uri},
+    response::{Html, Redirect},
     routing::get,
-    Router,
+    BoxError, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use poise::serenity_prelude::{self as serenity, GuildId, UserId};
 use serde::Deserialize;
-use std::sync::Arc;
-use tokio::net::TcpListener;
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use super::admin::{admin_router, AdminState};
 use super::auth::SharedSessionStore;
 use super::oauth::{DiscordUser, OAuthState, TokenResponse};
 use crate::logging::SharedLogBuffer;
-use crate::managers::{SharedConfigManager, SharedRoleManager, SharedVerificationManager};
+use crate::managers::{SharedChannelManager, SharedConfigManager, SharedRoleManager, SharedVerificationManager};
 use crate::state::TrackedUser;
 
 /// Web server configuration
 pub struct WebServerConfig {
-    pub port: u16,
+    /// HTTPS port (main server)
+    pub https_port: u16,
+    /// HTTP port (redirects to HTTPS)
+    pub http_port: u16,
+    /// Path to certificate PEM file (cert + CA bundle)
+    pub cert_path: PathBuf,
+    /// Path to private key PEM file
+    pub key_path: PathBuf,
 }
 
 impl Default for WebServerConfig {
     fn default() -> Self {
-        Self { port: 3000 }
+        Self {
+            https_port: 443,
+            http_port: 80,
+            cert_path: PathBuf::from("certs/cert.pem"),
+            key_path: PathBuf::from("certs/key.pem"),
+        }
     }
+}
+
+impl WebServerConfig {
+    /// Create config from environment variables
+    pub fn from_env() -> Self {
+        Self {
+            https_port: std::env::var("HTTPS_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(443),
+            http_port: std::env::var("HTTP_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80),
+            cert_path: std::env::var("TLS_CERT_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("certs/cert.pem")),
+            key_path: std::env::var("TLS_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("certs/key.pem")),
+        }
+    }
+}
+
+/// Ports configuration for HTTP to HTTPS redirect
+#[derive(Clone, Copy)]
+struct Ports {
+    http: u16,
+    https: u16,
 }
 
 /// Shared state for web handlers
@@ -54,6 +97,7 @@ pub async fn start_web_server(
     config_manager: SharedConfigManager,
     role_manager: SharedRoleManager,
     verification_manager: SharedVerificationManager,
+    channel_manager: SharedChannelManager,
     serenity_http: Arc<serenity::Http>,
     session_store: SharedSessionStore,
     log_buffer: SharedLogBuffer,
@@ -74,6 +118,8 @@ pub async fn start_web_server(
     let admin_state = AdminState {
         oauth,
         config_manager,
+        channel_manager,
+        role_manager: state.role_manager.clone(),
         session_store,
         log_buffer,
         serenity_http,
@@ -87,18 +133,116 @@ pub async fn start_web_server(
         .with_state(state)
         .nest("/admin", admin_router(admin_state));
 
-    let addr = format!("0.0.0.0:{}", config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Web server listening on http://{}", addr);
-    info!("Admin panel available at http://{}/admin", addr);
+    let ports = Ports {
+        http: config.http_port,
+        https: config.https_port,
+    };
+
+    // Load TLS configuration
+    let cert_path = config.cert_path.canonicalize().unwrap_or_else(|_| config.cert_path.clone());
+    let key_path = config.key_path.canonicalize().unwrap_or_else(|_| config.key_path.clone());
+
+    info!("Loading TLS certificates:");
+    info!("  Certificate: {}", cert_path.display());
+    info!("  Private key: {}", key_path.display());
+
+    // Check if files exist
+    if !config.cert_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Certificate file not found: {}",
+            cert_path.display()
+        ));
+    }
+    if !config.key_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Private key file not found: {}",
+            key_path.display()
+        ));
+    }
+
+    let tls_config = RustlsConfig::from_pem_file(&config.cert_path, &config.key_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(
+            "Failed to load TLS certificates: {}\n  Certificate: {}\n  Private key: {}\n\nHint: The private key must be in PKCS#8 PEM format. If you have an RSA key, convert it with:\n  openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt -in private.key -out key.pem",
+            e, cert_path.display(), key_path.display()
+        ))?;
+
+    // Spawn HTTP to HTTPS redirect server
+    tokio::spawn(redirect_http_to_https(ports));
+
+    let https_addr = SocketAddr::from(([0, 0, 0, 0], config.https_port));
+    info!("Web server listening on https://0.0.0.0:{}", config.https_port);
+    info!("HTTP redirect server on http://0.0.0.0:{}", config.http_port);
+    info!("Admin panel available at https://<your-domain>/admin");
     info!("=== Discord OAuth Configuration ===");
     info!("Add these Redirect URIs in Discord Developer Portal:");
     info!("  1. {}/callback        (for user verification)", base_url);
     info!("  2. {}/admin/callback  (for admin login)", base_url);
     info!("Portal: https://discord.com/developers/applications -> OAuth2 -> Redirects");
 
-    axum::serve(listener, app).await?;
+    axum_server::bind_rustls(https_addr, tls_config)
+        .serve(app.into_make_service())
+        .await?;
+
     Ok(())
+}
+
+/// Redirect all HTTP requests to HTTPS
+async fn redirect_http_to_https(ports: Ports) {
+    fn make_https(host: &str, uri: Uri, https_port: u16) -> Result<Uri, BoxError> {
+        let mut parts = uri.into_parts();
+
+        parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
+
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some("/".parse().unwrap());
+        }
+
+        let authority: axum::http::uri::Authority = host.parse()?;
+        let bare_host = match authority.port() {
+            Some(port_struct) => authority
+                .as_str()
+                .strip_suffix(port_struct.as_str())
+                .unwrap()
+                .strip_suffix(':')
+                .unwrap(),
+            None => authority.as_str(),
+        };
+
+        // Only add port if it's not the default HTTPS port
+        if https_port == 443 {
+            parts.authority = Some(bare_host.parse()?);
+        } else {
+            parts.authority = Some(format!("{bare_host}:{https_port}").parse()?);
+        }
+
+        Ok(Uri::from_parts(parts)?)
+    }
+
+    let redirect = move |Host(host): Host, uri: Uri| async move {
+        match make_https(&host, uri, ports.https) {
+            Ok(uri) => Ok(Redirect::permanent(&uri.to_string())),
+            Err(error) => {
+                warn!(%error, "Failed to convert URI to HTTPS");
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+    };
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], ports.http));
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("Failed to bind HTTP redirect server on port {}: {}", ports.http, e);
+            return;
+        }
+    };
+
+    info!("HTTP redirect server listening on {}", listener.local_addr().unwrap());
+
+    if let Err(e) = axum::serve(listener, redirect.into_make_service()).await {
+        error!("HTTP redirect server error: {}", e);
+    }
 }
 
 /// Health check endpoint
@@ -296,10 +440,21 @@ async fn oauth_callback(
         debug!("finding user...");
         match config.find_user_by_verification_id(verification_id) {
             Some((season, season_user)) => {
-                let special_roles = config.get_special_roles_for_user(verification_id);
-                let default_role = config.get_default_member_role_name().to_string();
+                // Special roles are looked up by Discord username
+                info!(
+                    "Looking up special roles for Discord username: '{}'",
+                    discord_user.username
+                );
+                let special_roles = config.get_special_roles_for_user(&discord_user.username);
 
-                let mut roles_to_assign = vec![default_role];
+                // Use the season's member_role (e.g., Medlem2025E) instead of global default
+                let member_role = season.member_role();
+                info!(
+                    "Using season member role '{}' for season '{}'",
+                    member_role, season.season_id
+                );
+
+                let mut roles_to_assign = vec![member_role];
                 roles_to_assign.extend(special_roles.clone());
 
                 Some((
@@ -461,20 +616,31 @@ async fn oauth_callback(
                 info!("Set nickname for {} to '{}'", user_id, display_name);
             }
 
-            // Assign roles
+            // Assign roles using sync_assignments_for_user for special roles
+            info!(
+                "Assigning {} roles to user {}: {:?}",
+                roles_to_assign.len(),
+                user_id,
+                roles_to_assign
+            );
             let role_manager = state.role_manager.read().await;
-            for role_name in &roles_to_assign {
-                if let Err(e) = role_manager
-                    .assign_role_to_user(&state.serenity_http, guild_id, user_id, role_name)
-                    .await
-                {
-                    error!(
-                        "Failed to assign role '{}' to {} in guild {}: {}. Bot requires 'Manage Roles' permission and the bot's role must be higher than the role being assigned.",
-                        role_name, user_id, guild_id, e
-                    );
-                } else {
-                    info!("Assigned role '{}' to {}", role_name, user_id);
-                }
+
+            // Use sync_assignments_for_user which handles checking existing roles and error messages
+            let (added, failed) = role_manager
+                .sync_assignments_for_user(
+                    &state.serenity_http,
+                    guild_id,
+                    user_id,
+                    &discord_user.username,
+                    &roles_to_assign,
+                )
+                .await;
+
+            if !added.is_empty() {
+                info!("Assigned roles to {}: {:?}", user_id, added);
+            }
+            if !failed.is_empty() {
+                warn!("Failed to assign some roles to {}: {:?}", user_id, failed);
             }
         }
     }

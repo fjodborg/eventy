@@ -8,14 +8,10 @@ use crate::managers::{SharedChannelManager, SharedConfigManager};
 /// Type of configuration file detected
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigType {
-    /// Season user list (e.g., "2025E.json")
+    /// Season user list (e.g., "2025E.json" or users.json)
     Season(String),
-    /// Special members file
+    /// Special members / assignments file
     SpecialMembers,
-    /// Global structure file
-    GlobalStructure,
-    /// Category-specific structure (e.g., "2025E_structure.json")
-    CategoryStructure(String),
     /// User database export
     UserDatabase,
     /// Unknown type
@@ -57,24 +53,15 @@ impl MaintainersManager {
         let filename_lower = filename.to_lowercase();
 
         // Check for special files first
-        if filename_lower == "special_members.json" {
+        if filename_lower == "special_members.json"
+            || filename_lower == "assignments.json"
+            || filename_lower == "roles.json"
+        {
             return ConfigType::SpecialMembers;
-        }
-
-        if filename_lower == "global_structure.json" {
-            return ConfigType::GlobalStructure;
         }
 
         if filename_lower == "user_database.json" {
             return ConfigType::UserDatabase;
-        }
-
-        // Check for category structure (ends with _structure.json)
-        if filename_lower.ends_with("_structure.json") {
-            let season_id = filename_lower
-                .trim_end_matches("_structure.json")
-                .to_string();
-            return ConfigType::CategoryStructure(season_id);
         }
 
         // Assume it's a season file if it ends with .json
@@ -126,19 +113,11 @@ impl MaintainersManager {
                 info!("Staging special members config");
                 config_manager.stage_special_members_from_bytes(&content, staged_by)
             }
-            ConfigType::GlobalStructure => {
-                info!("Staging global structure config");
-                config_manager.stage_global_structure_from_bytes(&content, staged_by)
-            }
-            ConfigType::CategoryStructure(season_id) => {
-                info!("Staging category structure for: {}", season_id);
-                config_manager.stage_category_structure_from_bytes(&content, staged_by)
-            }
             ConfigType::UserDatabase => {
-                // User database is a special case - we might want to import it
+                // User database is exported state, not a config to import
                 Err(BotError::ConfigValidation {
                     message:
-                        "User database imports are not yet supported. Use /import-user-db command."
+                        "User database files cannot be imported. This file is auto-generated state."
                             .to_string(),
                 })
             }
@@ -218,31 +197,19 @@ mod tests {
             ConfigType::SpecialMembers
         );
         assert_eq!(
-            detect_type_from_filename("global_structure.json"),
-            ConfigType::GlobalStructure
-        );
-        assert_eq!(
-            detect_type_from_filename("2025E_structure.json"),
-            ConfigType::CategoryStructure("2025e".to_string())
+            detect_type_from_filename("assignments.json"),
+            ConfigType::SpecialMembers
         );
     }
 
     fn detect_type_from_filename(filename: &str) -> ConfigType {
         let filename_lower = filename.to_lowercase();
 
-        if filename_lower == "special_members.json" {
+        if filename_lower == "special_members.json"
+            || filename_lower == "assignments.json"
+            || filename_lower == "roles.json"
+        {
             return ConfigType::SpecialMembers;
-        }
-
-        if filename_lower == "global_structure.json" {
-            return ConfigType::GlobalStructure;
-        }
-
-        if filename_lower.ends_with("_structure.json") {
-            let season_id = filename_lower
-                .trim_end_matches("_structure.json")
-                .to_string();
-            return ConfigType::CategoryStructure(season_id);
         }
 
         if filename_lower.ends_with(".json") {

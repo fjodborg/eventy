@@ -8,7 +8,6 @@ mod auth;
 mod oauth;
 mod server;
 
-pub use admin::{admin_router, AdminState};
-pub use auth::{create_session_store, SharedSessionStore};
+pub use auth::create_session_store;
 pub use oauth::OAuthState;
 pub use server::{start_web_server, WebServerConfig};

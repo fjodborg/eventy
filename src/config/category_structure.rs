@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Per-season category structure configuration
 /// Overrides or extends the global structure for a specific season
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CategoryStructureConfig {
     /// Season ID this structure applies to (e.g., "2025E")
     /// Optional because it might be inferred from the directory
@@ -17,10 +18,6 @@ pub struct CategoryStructureConfig {
     /// Full list of channels for this category (if provided, replaces global defaults)
     #[serde(default)]
     pub channels: Vec<ChannelDefinition>,
-
-    /// Full list of roles for this category (if provided, replaces global defaults)
-    #[serde(default)]
-    pub roles: Vec<RoleDefinition>,
 
     /// Role overrides for this season (replaces roles with same name from global)
     #[serde(default)]
@@ -64,10 +61,8 @@ impl CategoryStructureConfig {
         &self,
         global: &super::global_structure::GlobalStructureConfig,
     ) -> MergedStructure {
-        // If explicit roles are provided, use them. Otherwise merge overrides/additional with global.
-        let roles = if !self.roles.is_empty() {
-            self.roles.clone()
-        } else {
+        // Merge role overrides/additional with global defaults
+        let roles = {
             let mut roles = Vec::new();
             // Start with global roles
             for global_role in &global.default_roles {

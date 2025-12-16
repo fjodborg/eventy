@@ -4,6 +4,7 @@ use std::collections::HashMap;
 /// Global structure configuration - defines default channel layout and role permissions
 /// This is the base template that categories inherit from
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalStructureConfig {
     /// Default roles to create for each category
     #[serde(default)]
@@ -32,6 +33,8 @@ impl Default for GlobalStructureConfig {
                 mentionable: true,
                 position: None,
                 is_default_member_role: true,
+                permissions: vec![],
+                skip_permission_sync: false,
             }],
             default_channels: vec![ChannelDefinition {
                 name: "general".to_string(),
@@ -73,6 +76,7 @@ impl GlobalStructureConfig {
 
 /// Definition for a role
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleDefinition {
     /// Role name
     pub name: String,
@@ -96,10 +100,89 @@ pub struct RoleDefinition {
     /// Whether this is the default role for new members
     #[serde(default)]
     pub is_default_member_role: bool,
+
+    /// Server-level permissions for this role (e.g., ["CHANGE_NICKNAME", "CREATE_INSTANT_INVITE", "ADMINISTRATOR"])
+    /// If not specified, defaults to no permissions
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
+
+    /// If true, skip syncing permissions for this role (useful for roles managed manually in Discord)
+    #[serde(default)]
+    pub skip_permission_sync: bool,
+}
+
+impl RoleDefinition {
+    /// Check if permissions are explicitly specified in the config
+    /// Returns true if permissions should be synced (non-empty list or skip_permission_sync is false)
+    pub fn has_explicit_permissions(&self) -> bool {
+        !self.permissions.is_empty()
+    }
+
+    /// Parse permission strings into Discord Permissions
+    pub fn get_permissions(&self) -> poise::serenity_prelude::Permissions {
+        use poise::serenity_prelude::Permissions;
+
+        let mut perms = Permissions::empty();
+        for name in &self.permissions {
+            match name.to_uppercase().as_str() {
+                "CREATE_INSTANT_INVITE" => perms |= Permissions::CREATE_INSTANT_INVITE,
+                "KICK_MEMBERS" => perms |= Permissions::KICK_MEMBERS,
+                "BAN_MEMBERS" => perms |= Permissions::BAN_MEMBERS,
+                "ADMINISTRATOR" => perms |= Permissions::ADMINISTRATOR,
+                "MANAGE_CHANNELS" => perms |= Permissions::MANAGE_CHANNELS,
+                "MANAGE_GUILD" => perms |= Permissions::MANAGE_GUILD,
+                "ADD_REACTIONS" => perms |= Permissions::ADD_REACTIONS,
+                "VIEW_AUDIT_LOG" => perms |= Permissions::VIEW_AUDIT_LOG,
+                "PRIORITY_SPEAKER" => perms |= Permissions::PRIORITY_SPEAKER,
+                "STREAM" => perms |= Permissions::STREAM,
+                "VIEW_CHANNEL" => perms |= Permissions::VIEW_CHANNEL,
+                "SEND_MESSAGES" => perms |= Permissions::SEND_MESSAGES,
+                "SEND_TTS_MESSAGES" => perms |= Permissions::SEND_TTS_MESSAGES,
+                "MANAGE_MESSAGES" => perms |= Permissions::MANAGE_MESSAGES,
+                "EMBED_LINKS" => perms |= Permissions::EMBED_LINKS,
+                "ATTACH_FILES" => perms |= Permissions::ATTACH_FILES,
+                "READ_MESSAGE_HISTORY" => perms |= Permissions::READ_MESSAGE_HISTORY,
+                "MENTION_EVERYONE" => perms |= Permissions::MENTION_EVERYONE,
+                "USE_EXTERNAL_EMOJIS" => perms |= Permissions::USE_EXTERNAL_EMOJIS,
+                "VIEW_GUILD_INSIGHTS" => perms |= Permissions::VIEW_GUILD_INSIGHTS,
+                "CONNECT" => perms |= Permissions::CONNECT,
+                "SPEAK" => perms |= Permissions::SPEAK,
+                "MUTE_MEMBERS" => perms |= Permissions::MUTE_MEMBERS,
+                "DEAFEN_MEMBERS" => perms |= Permissions::DEAFEN_MEMBERS,
+                "MOVE_MEMBERS" => perms |= Permissions::MOVE_MEMBERS,
+                "USE_VAD" => perms |= Permissions::USE_VAD,
+                "CHANGE_NICKNAME" => perms |= Permissions::CHANGE_NICKNAME,
+                "MANAGE_NICKNAMES" => perms |= Permissions::MANAGE_NICKNAMES,
+                "MANAGE_ROLES" => perms |= Permissions::MANAGE_ROLES,
+                "MANAGE_WEBHOOKS" => perms |= Permissions::MANAGE_WEBHOOKS,
+                "MANAGE_EMOJIS" => perms |= Permissions::MANAGE_GUILD_EXPRESSIONS,
+                "USE_APPLICATION_COMMANDS" => perms |= Permissions::USE_APPLICATION_COMMANDS,
+                "REQUEST_TO_SPEAK" => perms |= Permissions::REQUEST_TO_SPEAK,
+                "MANAGE_EVENTS" => perms |= Permissions::MANAGE_EVENTS,
+                "MANAGE_THREADS" => perms |= Permissions::MANAGE_THREADS,
+                "CREATE_PUBLIC_THREADS" => perms |= Permissions::CREATE_PUBLIC_THREADS,
+                "CREATE_PRIVATE_THREADS" => perms |= Permissions::CREATE_PRIVATE_THREADS,
+                "USE_EXTERNAL_STICKERS" => perms |= Permissions::USE_EXTERNAL_STICKERS,
+                "SEND_MESSAGES_IN_THREADS" => perms |= Permissions::SEND_MESSAGES_IN_THREADS,
+                "USE_EMBEDDED_ACTIVITIES" => perms |= Permissions::USE_EMBEDDED_ACTIVITIES,
+                "MODERATE_MEMBERS" => perms |= Permissions::MODERATE_MEMBERS,
+                "MANAGE_GUILD_EXPRESSIONS" => perms |= Permissions::MANAGE_GUILD_EXPRESSIONS,
+                unknown => {
+                    tracing::warn!(
+                        "Unknown permission string '{}' in role '{}', ignoring",
+                        unknown,
+                        self.name
+                    );
+                }
+            }
+        }
+        perms
+    }
 }
 
 /// Definition for a channel (or category)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelDefinition {
     /// Channel name
     pub name: String,
@@ -312,6 +395,7 @@ impl ChannelPermissionLevel {
 
 /// Named permission preset
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionPreset {
     pub name: String,
     #[serde(default)]
@@ -322,6 +406,7 @@ pub struct PermissionPreset {
 
 /// Set of allowed and denied permissions
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionSet {
     #[serde(default)]
     pub allow: Vec<String>,

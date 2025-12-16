@@ -53,7 +53,6 @@ struct DiscordUser {
     id: String,
     username: String,
     global_name: Option<String>,
-    #[allow(dead_code)]
     discriminator: String,
 }
 

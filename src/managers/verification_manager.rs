@@ -51,9 +51,11 @@ impl VerificationManager {
     }
 
     /// Attempt verification with a provided ID
+    /// `discord_username` is the actual Discord username (not nickname) for special role lookup
     pub async fn attempt_verification(
         &self,
         user_id: UserId,
+        discord_username: &str,
         provided_id: &str,
     ) -> VerificationResult {
         let provided_id = provided_id.trim();
@@ -111,11 +113,17 @@ impl VerificationManager {
             }
         }
 
-        // Found the user! Get their special roles too
-        let special_roles = config.get_special_roles_for_user(provided_id);
-        let default_role = config.get_default_member_role_name().to_string();
+        // Found the user! Get their special roles by Discord username
+        let special_roles = config.get_special_roles_for_user(discord_username);
 
-        let mut roles_to_assign = vec![default_role];
+        // Get the season-specific member role (e.g., "Medlem2025F")
+        // This is loaded from season.json's member_role field, or falls back to "Medlem{season_id}"
+        let season_member_role = config
+            .get_season(&season_id)
+            .map(|s| s.member_role())
+            .unwrap_or_else(|| format!("Medlem{}", season_id));
+
+        let mut roles_to_assign = vec![season_member_role];
         roles_to_assign.extend(special_roles.clone());
 
         let display_name = season_user.name.clone();
