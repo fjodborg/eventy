@@ -58,6 +58,58 @@ pub struct Data {
     pub maintainers_manager: SharedMaintainersManager,
 }
 
+async fn clear_all_commands(
+    ctx: &serenity::Context,
+    guild_id: serenity::GuildId,
+) -> Result<(), Error> {
+    info!("Clearing all existing commands for guild: {}", guild_id);
+    
+    // Get all existing commands
+    let existing_commands = match guild_id.get_commands(&ctx.http).await {
+        Ok(commands) => commands,
+        Err(e) => {
+            error!("Failed to fetch existing commands for guild {}: {}", guild_id, e);
+            return Err(e.into());
+        }
+    };
+    
+    info!("Found {} existing commands in guild {}", existing_commands.len(), guild_id);
+    
+    // Delete each command individually
+    for command in existing_commands {
+        info!("Deleting command: {} (ID: {})", command.name, command.id);
+        if let Err(e) = guild_id.delete_command(&ctx.http, command.id).await {
+            error!("Failed to delete command {} ({}): {}", command.name, command.id, e);
+        } else {
+            info!("Successfully deleted command: {}", command.name);
+        }
+    }
+    
+    // Also clear global commands if any exist (usually not needed for guild bots)
+    let global_commands = match ctx.http.get_global_commands().await {
+        Ok(commands) => commands,
+        Err(e) => {
+            warn!("Failed to fetch global commands: {}", e);
+            Vec::new()
+        }
+    };
+    
+    if !global_commands.is_empty() {
+        info!("Found {} global commands, clearing them", global_commands.len());
+        for command in global_commands {
+            info!("Deleting global command: {} (ID: {})", command.name, command.id);
+            if let Err(e) = ctx.http.delete_global_command(command.id).await {
+                error!("Failed to delete global command {} ({}): {}", command.name, command.id, e);
+            } else {
+                info!("Successfully deleted global command: {}", command.name);
+            }
+        }
+    }
+    
+    info!("Finished clearing commands for guild: {}", guild_id);
+    Ok(())
+}
+
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
