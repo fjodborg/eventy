@@ -19,7 +19,7 @@ use super::auth::SharedSessionStore;
 use super::oauth::{DiscordUser, OAuthState, TokenResponse};
 use crate::logging::SharedLogBuffer;
 use crate::managers::{SharedChannelManager, SharedConfigManager, SharedRoleManager, SharedVerificationManager};
-use crate::state::TrackedUser;
+use crate::state::{SharedUserDatabase, TrackedUser};
 
 /// Web server configuration
 pub struct WebServerConfig {
@@ -98,6 +98,7 @@ pub async fn start_web_server(
     role_manager: SharedRoleManager,
     verification_manager: SharedVerificationManager,
     channel_manager: SharedChannelManager,
+    user_database: SharedUserDatabase,
     serenity_http: Arc<serenity::Http>,
     session_store: SharedSessionStore,
     log_buffer: SharedLogBuffer,
@@ -120,6 +121,7 @@ pub async fn start_web_server(
         config_manager,
         channel_manager,
         role_manager: state.role_manager.clone(),
+        user_database,
         session_store,
         log_buffer,
         serenity_http,

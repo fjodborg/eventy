@@ -40,6 +40,7 @@ pub struct AdminState {
     pub config_manager: SharedConfigManager,
     pub channel_manager: SharedChannelManager,
     pub role_manager: SharedRoleManager,
+    pub user_database: crate::state::SharedUserDatabase,
     pub session_store: SharedSessionStore,
     pub log_buffer: SharedLogBuffer,
     pub serenity_http: Arc<serenity::Http>,
@@ -264,19 +265,24 @@ async fn dashboard(
 
     // Get season and global config info
     let config = state.config_manager.read().await;
+    let user_db = state.user_database.read().await;
+
     let seasons: Vec<_> = config
         .get_seasons()
         .iter()
         .map(|(id, season)| {
+            let activated_count = user_db.get_users_by_season(id).len();
             format!(
-                "<tr><td><a href=\"/admin/season/{}\">{}</a></td><td>{}</td><td>{}</td></tr>",
+                "<tr><td><a href=\"/admin/season/{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 id,
                 id,
                 if season.name().is_empty() { id } else { season.name() },
-                season.user_count()
+                season.user_count(),
+                activated_count
             )
         })
         .collect();
+    drop(user_db);
 
     // Get global config status
     let roles_count = config.get_global_roles().map(|r| r.roles.len()).unwrap_or(0);
@@ -416,6 +422,7 @@ async fn dashboard(
                     <th>ID</th>
                     <th>Name</th>
                     <th>Users</th>
+                    <th>Activated</th>
                 </tr>
             </thead>
             <tbody>

@@ -366,6 +366,7 @@ async fn main() -> Result<()> {
                     let web_verification_manager = verification_manager.clone();
                     let web_channel_manager = channel_manager.clone();
                     let web_log_buffer = log_buffer.clone();
+                    let web_user_database = shared_user_database.clone();
 
                     // Create session store for admin panel
                     let session_store = web::create_session_store();
@@ -389,6 +390,7 @@ async fn main() -> Result<()> {
                             web_role_manager,
                             web_verification_manager,
                             web_channel_manager,
+                            web_user_database,
                             serenity_http,
                             session_store,
                             web_log_buffer,
