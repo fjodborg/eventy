@@ -1,43 +1,61 @@
-# Discord Verification Bot
-A Discord bot built in Rust that provides automated user verification through private messages, role management, and channel access control. The bot maintains a user database and ensures only verified users can access member-only channels.
+# Eventy - Discord Verification Bot
 
-## 🛠️ Installation
+A Discord bot built in Rust that provides automated user verification through OAuth2, role management, and channel access control. The bot supports seasonal member management and ensures only verified users can access member-only channels.
+
+## Features
+
+- OAuth2-based user verification via web interface
+- Season-based member and channel management
+- Configurable roles and permissions through JSON files
+- TLS/HTTPS support for secure verification
+- Automatic role assignment and channel permission management
+
+## Installation
 
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/fjodborg/eventy
-cd discord-verification-bot
+cd eventy
 ```
 
 ### 2. Environment Setup
-Modify the `.env` file in the project root:
+Create a `.env` file in the project root:
 ```env
-DISCORD_TOKEN=your_discord_bot_token_here
+# Discord Bot Configuration
+DISCORD_TOKEN="your_discord_bot_token_here"
+DISCORD_CLIENT_ID="your_client_id_here"
+DISCORD_CLIENT_SECRET="your_client_secret_here"
+DISCORD_GUILD_ID="your_guild_id_here"
+
+# Web Server Configuration
+WEB_BASE_URL="https://your-domain.com"
+TLS_CERT_PATH=certs/cert.pem
+TLS_KEY_PATH=certs/key.pem
+HTTPS_PORT=443
+HTTP_PORT=80
 ```
 
-### 3. Database Setup
-Modify the `data/users.json` with your data. Example:
-``` json
-[ 
-  {
-    \"Name\": \"John Doe\",
-    \"DiscordId\": \"user123456\"
-  },
-  {
-    \"Name\": \"Jane Smith\", 
-    \"DiscordId\": \"user789012\"
-  }
-]
-```
-
-### 4. Discord Bot Setup
+### 3. Discord Bot Setup
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application
-3. Navigate to \"Bot\" section
-4. Copy the bot token to your `.env` file
-5. Enable the following **Privileged Gateway Intents**:
+3. Navigate to "Bot" section and copy the bot token
+4. Navigate to "OAuth2" section and copy the Client ID and Client Secret
+5. Add your redirect URL under OAuth2 > Redirects (e.g., `https://your-domain.com/callback`)
+6. Enable the following **Privileged Gateway Intents**:
    - Server Members Intent
    - Message Content Intent
+
+### 4. TLS Certificate Setup
+Place your TLS certificates in the `certs/` directory:
+```bash
+mkdir -p certs
+# Add your cert.pem and key.pem files
+```
+
+For development/testing, you can use a tunnel service like Cloudflare:
+```bash
+podman run --rm -it --network host cloudflare/cloudflared:latest tunnel --url http://localhost:3000
+```
 
 ### 5. Bot Permissions
 Invite your bot with the following permissions:
@@ -49,8 +67,86 @@ Invite your bot with the following permissions:
 - `Read Message History`
 - `Use Slash Commands`
 
+## Data Structure
 
-## 🏃‍♂️ Running the Bot
+The bot uses a JSON-based configuration system:
+
+```
+data/
+├── global/
+│   ├── roles.json        # Role definitions (colors, permissions)
+│   ├── permissions.json  # Permission presets (read, readwrite, admin, etc.)
+│   └── assignments.json  # User role assignments
+└── seasons/
+    ├── template/         # Template for new seasons
+    │   ├── season.json   # Season configuration
+    │   └── users.json    # Member list
+    └── 2025E/            # Example season
+        ├── season.json
+        └── users.json
+```
+
+### Roles Configuration (`data/global/roles.json`)
+```json
+{
+  "roles": [
+    {
+      "name": "Medlem2025E",
+      "color": "#2ecc71",
+      "hoist": false,
+      "mentionable": true,
+      "is_default_member_role": true
+    }
+  ]
+}
+```
+
+### Permission Presets (`data/global/permissions.json`)
+```json
+{
+  "definitions": {
+    "read": {
+      "allow": ["VIEW_CHANNEL", "READ_MESSAGE_HISTORY"],
+      "deny": ["SEND_MESSAGES"]
+    },
+    "readwrite": {
+      "allow": ["VIEW_CHANNEL", "READ_MESSAGE_HISTORY", "SEND_MESSAGES", "ATTACH_FILES", "ADD_REACTIONS"],
+      "deny": []
+    }
+  }
+}
+```
+
+### Season Configuration (`data/seasons/<season>/season.json`)
+```json
+{
+  "name": "Spring 2025",
+  "active": true,
+  "member_role": "Medlem2025E",
+  "channels": [
+    {
+      "name": "general",
+      "type": "text",
+      "position": 0,
+      "role_permissions": {
+        "Medlem2025E": "readwrite"
+      }
+    }
+  ]
+}
+```
+
+### Users Database (`data/seasons/<season>/users.json`)
+```json
+[
+  {
+    "Name": "John Doe",
+    "DiscordId": "unique-user-id-123"
+  }
+]
+```
+
+## Running the Bot
 
 ### Development Mode
 ```bash
@@ -62,151 +158,53 @@ cargo run
 cargo run --release
 ```
 
-### Using Docker (Optional)
-TODO: Implement docker solution.
-## 📚 Usage
+## Usage
 
-### For New Members
-The flow looks like this:
-1. User gets a welcome messages to check DM.
-2. In the DM the user is requested an userid.
-3. Once the ID has been validated the user gets a define name assigned and the corresponding channel permissions. 
+### Verification Flow
+1. User receives a verification link: `https://your-domain.com/verify/<user-id>`
+2. User clicks the link and authenticates with Discord OAuth2
+3. Bot verifies the user ID against the database
+4. Upon successful verification:
+   - User receives the appropriate season member role
+   - Nickname is updated to match the database
+   - Channel permissions are applied automatically
 
 ### Commands
-
-``` bash
-#Test bot connectivity and responsiveness.
+```bash
+# Test bot connectivity
 /ping
-# Manually start the verification process for yourself.
+
+# Manually trigger verification
 /verify
-# Display all users in the database (requires Administrator permission).
+
+# List all users (requires Administrator)
 /list_users
 ```
 
-### Verification Flow Example
+## Troubleshooting
+
+### Bot Not Responding
+- Verify `DISCORD_TOKEN` is correct
+- Check bot has required permissions in server
+- Ensure Server Members and Message Content intents are enabled
+
+### OAuth Verification Not Working
+- Verify `DISCORD_CLIENT_ID` and `DISCORD_CLIENT_SECRET` are correct
+- Check `WEB_BASE_URL` matches your redirect URI in Discord Developer Portal
+- Ensure TLS certificates are valid and accessible
+- Verify the user ID exists in the season's `users.json`
+
+### Permission Errors
+- Bot role must be higher than target user roles in the role hierarchy
+- Ensure bot has `Manage Roles` and `Manage Nicknames` permissions
+- Bot needs `Manage Channels` for channel permission overwrites
+
+## Logging
+
+The bot uses structured logging with levels: ERROR, WARN, INFO, DEBUG
+
 ```
-Bot: 👋 Hello, John!
-
-🔐 Identity Verification Required
-
-To gain full access to the server, you need to verify your identity.
-Please provide your user ID by replying to this message.
-
-Simply reply with your user ID.
-
-Example: SomeId
-
-User: user123456
-
-Bot: ✅ Verification Successful!
-
-Welcome, John Doe!
-
-Your identity has been verified and I'm now updating your server access:
-• Setting your nickname to: John Doe
-• Assigning you the Member role
-• Granting access to member channels
+2025-01-15T10:30:45.123Z INFO  eventy: Bot logged in as: VerificationBot
+2025-01-15T10:30:45.124Z INFO  eventy: Successfully loaded 150 users from database
+2025-01-15T10:31:12.456Z INFO  eventy: OAuth verification completed for user: john_doe
 ```
-
-## 🔧 Configuration
-
-### Channel Access Rules
-TODO: This section needed rework, once things aren't hardcoded.
-The bot automatically manages channel access based on naming conventions:
-
-**Always Accessible** (Unverified + Verified):
-- `welcome`
-- `rules` 
-- `announcements`
-- `verification`
-
-**Member Only** (Verified):
-- `general`
-- `chat`
-- `discussion`
-- `off-topic`
-- All other channels (default)
-
-### Role Management
-- **Unverified Role**: Automatically removed upon verification
-- **Member Role**: Automatically assigned upon verification
-
-*Note: These roles must exist in your Discord server for the bot to work*
-
-### Customization
-TODO: This section needed rework, once things aren't hardcoded.
-Modify message templates in `src/messages.rs`:
-- `welcome_message()`: Server welcome message
-- `verification_message()`: DM verification prompt
-- `success_message()`: Verification success confirmation
-- `error_message()`: Verification failure notification
-
-
-The bot uses structured logging with different levels:
-
-- **ERROR**: Errors requiring attention
-- **WARN**: Issues that should be monitored
-- **INFO**: General operational information
-- **DEBUG**: Detailed debugging information
-
-### Log Output Example
-TODO: Add some sort of log output for admins.
-```
-2024-01-15T10:30:45.123Z INFO  discord_verification_bot: Bot logged in as: VerificationBot
-2024-01-15T10:30:45.124Z INFO  discord_verification_bot: Successfully loaded 150 users from database
-2024-01-15T10:31:12.456Z INFO  discord_verification_bot::user_manager: New member joined: John Doe (123456789) in guild: 987654321
-2024-01-15T10:31:12.789Z DEBUG discord_verification_bot::commands: Starting DM verification process for: John Doe
-```
-
-## 🚨 Troubleshooting
-
-### Common Issues
-
-#### Bot Not Responding
-- **Check Token**: Ensure `DISCORD_TOKEN` is correct
-- **Verify Permissions**: Bot needs required permissions in server
-- **Check Intents**: Enable Server Members and Message Content intents
-
-#### Verification Not Working
-- **Database Format**: Ensure `users.json` follows correct structure
-- **User ID Match**: Verify user IDs in database match expected format
-- **DM Permissions**: Users must allow DMs from server members
-
-#### Permission Errors
-- **Role Hierarchy**: Bot role must be higher than target user roles
-- **Missing Permissions**: Ensure bot has `Manage Roles` and `Manage Nicknames`
-- **Channel Permissions**: Bot needs `Manage Channels` for permission overwrites
-
-### Health Checks
-Use the `/ping` command to verify bot connectivity and responsiveness.
-
-### TODO Roadmap
-- [ ] Add proper Database access instead of json.
-- [ ] Add option to `/verify` through DM.
-- [ ] Add event planning.
-- [ ] Add log output for admin users.
-- [ ] Add configuration messages to setup welcome messages, validation formats, roles, users access etc.
-- [ ] Create file/command for configuring channels that should exist and under which category.
-- [ ] Add way to enforce permissions when bot join.
-- [ ] Add dynamically loaded log levels.
-- [ ] Add validation memory and process to assign users after they have joined and the bot was offline..
-- [ ] Add channel creation option to generate the channels.
-- [ ] Add default welcome message for everyone that should say that a welcome message will arrive if bot is online.
-- [ ] Add better serde serialization printout. e.g. File path.
-- [x] Add code to generate roles.
-    - [ ] Add option to modify roles after creation e.g. color .
-- [ ] Add separate role folder for privileged users and their id. 
-
-
-### TODO Make readme about bot setup
-
-add bot id and secret to .env and token
-Modify guild id
-
-Add redirect to discord develop
-
-Open a tunnel to the WWW.
-and use it like this e.g. this: https://journals-perl-psychological-mike.trycloudflare.com/verify/my-unique-user-id
-
-add `podman run --rm -it --network host cloudflare/cloudflared:latest tunnel --url http://localhost:3000` 
-
