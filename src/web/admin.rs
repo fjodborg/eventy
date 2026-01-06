@@ -484,16 +484,36 @@ async fn season_detail(
         }
     };
 
+    // Get user database to check verification status
+    let user_db = state.user_database.read().await;
+
     let users_html: Vec<_> = season
         .users
         .iter()
         .enumerate()
         .map(|(i, user)| {
+            // Check if user is actually verified in the database
+            let verified_user = user_db.find_by_verification_id(&user.id);
+            let is_verified = verified_user
+                .map(|u| u.verification_status == crate::state::user_database::VerificationStatus::Verified)
+                .unwrap_or(false);
+
+            let (status_text, status_color) = if is_verified {
+                ("Verified", "#2ecc71")
+            } else {
+                ("Not Verified", "#95a5a6")
+            };
+
+            let status_badge = format!(
+                "<span style='background:{};color:#fff;padding:0.25rem 0.5rem;border-radius:4px;font-size:0.875rem;'>{}</span>",
+                status_color, status_text
+            );
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 i + 1,
                 user.name,
-                &user.id[..8.min(user.id.len())]
+                &user.id[..8.min(user.id.len())],
+                status_badge
             )
         })
         .collect();
@@ -594,6 +614,7 @@ async fn season_detail(
                     <th>#</th>
                     <th>Name</th>
                     <th>ID (partial)</th>
+                    <th>Status</th>
                 </tr>
             </thead>
             <tbody>
