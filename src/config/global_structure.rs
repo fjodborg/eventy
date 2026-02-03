@@ -241,6 +241,8 @@ pub enum ChannelPermissionLevel {
     Read,
     /// Can view, read, and send messages
     ReadWrite,
+    /// Can view, read, and send messages
+    ReadCmd,
     /// Full channel management
     Admin,
 }
@@ -322,6 +324,7 @@ impl ChannelPermissionLevel {
         let level_name = match self {
             ChannelPermissionLevel::None => "none",
             ChannelPermissionLevel::Read => "read",
+            ChannelPermissionLevel::ReadCmd => "readcmd",
             ChannelPermissionLevel::ReadWrite => "readwrite",
             ChannelPermissionLevel::Admin => "admin",
         };
@@ -339,57 +342,13 @@ impl ChannelPermissionLevel {
             return (parse_perms(&def.allow), parse_perms(&def.deny));
         }
 
-        // Fallback to hardcoded defaults if not defined
-        match self {
-            ChannelPermissionLevel::None => (
-                Permissions::empty(),
-                Permissions::VIEW_CHANNEL | Permissions::CONNECT,
-            ),
-            ChannelPermissionLevel::Read => match channel_type {
-                ChannelType::Voice | ChannelType::Stage => (
-                    Permissions::VIEW_CHANNEL | Permissions::CONNECT | Permissions::SPEAK,
-                    Permissions::empty(),
-                ),
-                _ => (
-                    Permissions::VIEW_CHANNEL | Permissions::READ_MESSAGE_HISTORY,
-                    Permissions::SEND_MESSAGES,
-                ),
-            },
-            ChannelPermissionLevel::ReadWrite => match channel_type {
-                ChannelType::Voice | ChannelType::Stage => (
-                    Permissions::VIEW_CHANNEL
-                        | Permissions::CONNECT
-                        | Permissions::SPEAK
-                        | Permissions::STREAM
-                        | Permissions::USE_VAD,
-                    Permissions::empty(),
-                ),
-                _ => (
-                    Permissions::VIEW_CHANNEL
-                        | Permissions::READ_MESSAGE_HISTORY
-                        | Permissions::SEND_MESSAGES
-                        | Permissions::ATTACH_FILES
-                        | Permissions::ADD_REACTIONS,
-                    Permissions::empty(),
-                ),
-            },
-            ChannelPermissionLevel::Admin => (
-                Permissions::VIEW_CHANNEL
-                    | Permissions::READ_MESSAGE_HISTORY
-                    | Permissions::SEND_MESSAGES
-                    | Permissions::ATTACH_FILES
-                    | Permissions::ADD_REACTIONS
-                    | Permissions::MANAGE_MESSAGES
-                    | Permissions::MANAGE_CHANNELS
-                    | Permissions::MANAGE_WEBHOOKS
-                    | Permissions::CONNECT
-                    | Permissions::SPEAK
-                    | Permissions::MUTE_MEMBERS
-                    | Permissions::DEAFEN_MEMBERS
-                    | Permissions::MOVE_MEMBERS,
-                Permissions::empty(),
-            ),
-        }
+        // Fallback if not defined
+        tracing::warn!(
+            "Permission definition not found for level '{}' (voice={}). Using empty permissions.",
+            level_name,
+            is_voice
+        );
+        (Permissions::empty(), Permissions::empty())
     }
 }
 

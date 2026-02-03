@@ -37,6 +37,8 @@ impl GlobalPermissionsConfig {
 impl Default for GlobalPermissionsConfig {
     fn default() -> Self {
         let mut definitions = HashMap::new();
+
+        // "none" level
         definitions.insert(
             "none".to_string(),
             PermissionSet {
@@ -44,16 +46,24 @@ impl Default for GlobalPermissionsConfig {
                 deny: vec!["VIEW_CHANNEL".to_string(), "CONNECT".to_string()],
             },
         );
+
+        // "read" level - merged text and voice permissions
+        // Text: View + Read History
+        // Voice: View + Connect + Speak
         definitions.insert(
             "read".to_string(),
             PermissionSet {
                 allow: vec![
                     "VIEW_CHANNEL".to_string(),
                     "READ_MESSAGE_HISTORY".to_string(),
+                    "CONNECT".to_string(),
+                    "SPEAK".to_string(),
                 ],
                 deny: vec!["SEND_MESSAGES".to_string()],
             },
         );
+
+        // "readwrite" level - merged text and voice permissions
         definitions.insert(
             "readwrite".to_string(),
             PermissionSet {
@@ -63,10 +73,16 @@ impl Default for GlobalPermissionsConfig {
                     "SEND_MESSAGES".to_string(),
                     "ATTACH_FILES".to_string(),
                     "ADD_REACTIONS".to_string(),
+                    "CONNECT".to_string(),
+                    "SPEAK".to_string(),
+                    "STREAM".to_string(),
+                    "USE_VAD".to_string(),
                 ],
                 deny: vec![],
             },
         );
+
+        // "admin" level - full access
         definitions.insert(
             "admin".to_string(),
             PermissionSet {
@@ -74,12 +90,21 @@ impl Default for GlobalPermissionsConfig {
                     "VIEW_CHANNEL".to_string(),
                     "READ_MESSAGE_HISTORY".to_string(),
                     "SEND_MESSAGES".to_string(),
+                    "ATTACH_FILES".to_string(),
+                    "ADD_REACTIONS".to_string(),
                     "MANAGE_MESSAGES".to_string(),
                     "MANAGE_CHANNELS".to_string(),
+                    "MANAGE_WEBHOOKS".to_string(),
+                    "CONNECT".to_string(),
+                    "SPEAK".to_string(),
+                    "MUTE_MEMBERS".to_string(),
+                    "DEAFEN_MEMBERS".to_string(),
+                    "MOVE_MEMBERS".to_string(),
                 ],
                 deny: vec![],
             },
         );
+
         Self { definitions }
     }
 }

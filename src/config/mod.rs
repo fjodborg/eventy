@@ -7,7 +7,7 @@ pub mod special_members;
 pub mod staging;
 
 pub use category_structure::CategoryStructureConfig;
-pub use global_permissions::{GlobalPermissionsConfig, PermissionSet};
+pub use global_permissions::GlobalPermissionsConfig;
 pub use global_roles::{GlobalRolesConfig, RoleDefinition};
 pub use global_structure::{
     ChannelDefinition, ChannelPermissionLevel, ChannelType, GlobalStructureConfig,

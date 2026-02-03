@@ -7,7 +7,7 @@ use super::config_manager::SharedConfigManager;
 use super::role_manager::SharedRoleManager;
 use crate::config::{
     CategoryStructureConfig, ChannelDefinition, ChannelPermissionLevel, ChannelType,
-    GlobalStructureConfig,
+    GlobalPermissionsConfig, GlobalStructureConfig,
 };
 use crate::error::Result;
 use crate::state::{ChannelState, SharedChannelState};
@@ -34,10 +34,16 @@ impl UpdateSummary {
 
         // Roles
         if !self.roles_created.is_empty() {
-            lines.push(format!("**Roles created:** {}", self.roles_created.join(", ")));
+            lines.push(format!(
+                "**Roles created:** {}",
+                self.roles_created.join(", ")
+            ));
         }
         if !self.roles_existing.is_empty() {
-            lines.push(format!("**Roles verified:** {}", self.roles_existing.join(", ")));
+            lines.push(format!(
+                "**Roles verified:** {}",
+                self.roles_existing.join(", ")
+            ));
         }
 
         // Category
@@ -50,23 +56,38 @@ impl UpdateSummary {
 
         // Channels
         if !self.channels_created.is_empty() {
-            lines.push(format!("**Channels created:** {}", self.channels_created.join(", ")));
+            lines.push(format!(
+                "**Channels created:** {}",
+                self.channels_created.join(", ")
+            ));
         }
         if !self.channels_updated.is_empty() {
-            lines.push(format!("**Channels updated:** {}", self.channels_updated.join(", ")));
+            lines.push(format!(
+                "**Channels updated:** {}",
+                self.channels_updated.join(", ")
+            ));
         }
         if !self.channels_reordered.is_empty() {
-            lines.push(format!("**Channels reordered:** {}", self.channels_reordered.join(", ")));
+            lines.push(format!(
+                "**Channels reordered:** {}",
+                self.channels_reordered.join(", ")
+            ));
         }
 
         // Permissions summary
         if !self.permissions_applied.is_empty() {
-            lines.push(format!("**Permissions configured:** {} role/channel pairs", self.permissions_applied.len()));
+            lines.push(format!(
+                "**Permissions configured:** {} role/channel pairs",
+                self.permissions_applied.len()
+            ));
         }
 
         // Missing roles
         if !self.missing_roles.is_empty() {
-            lines.push(format!("**Missing roles:** {}", self.missing_roles.join(", ")));
+            lines.push(format!(
+                "**Missing roles:** {}",
+                self.missing_roles.join(", ")
+            ));
         }
 
         // Warnings
@@ -389,7 +410,7 @@ impl ChannelManager {
         let permission_definitions = config
             .get_global_permissions()
             .map(|p| p.definitions.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| GlobalPermissionsConfig::default().definitions);
         drop(config);
 
         // Build a GlobalStructureConfig with the loaded permission definitions
@@ -595,7 +616,10 @@ impl ChannelManager {
                     });
 
                     if let Err(e) = channel_id
-                        .edit(http, serenity::EditChannel::new().permissions(new_overwrites))
+                        .edit(
+                            http,
+                            serenity::EditChannel::new().permissions(new_overwrites),
+                        )
                         .await
                     {
                         warn!("Failed to add bot permission to category '{}': {}", name, e);
@@ -769,7 +793,7 @@ impl ChannelManager {
         let permission_definitions = config
             .get_global_permissions()
             .map(|p| p.definitions.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| GlobalPermissionsConfig::default().definitions);
         drop(config);
 
         // Build a GlobalStructureConfig with the loaded permission definitions
@@ -855,7 +879,11 @@ impl ChannelManager {
         let mut summary = UpdateSummary::default();
 
         // Ensure category exists
-        info!("Syncing season channels: category='{}', {} channels", category_name, channels.len());
+        info!(
+            "Syncing season channels: category='{}', {} channels",
+            category_name,
+            channels.len()
+        );
         let (category_id, cat_created) = self
             .ensure_category_exists_tracked(http, guild_id, category_name)
             .await?;
@@ -867,9 +895,17 @@ impl ChannelManager {
         }
 
         // Set @everyone deny on the category itself for season isolation
-        if let Err(e) = self.deny_everyone_on_channel(http, guild_id, category_id).await {
-            warn!("Failed to set @everyone deny on category '{}': {}", category_name, e);
-            summary.warnings.push(format!("Failed to deny @everyone on category: {}", e));
+        if let Err(e) = self
+            .deny_everyone_on_channel(http, guild_id, category_id)
+            .await
+        {
+            warn!(
+                "Failed to set @everyone deny on category '{}': {}",
+                category_name, e
+            );
+            summary
+                .warnings
+                .push(format!("Failed to deny @everyone on category: {}", e));
         } else {
             info!("Set @everyone deny on category '{}'", category_name);
         }
@@ -894,16 +930,28 @@ impl ChannelManager {
         }
 
         // Reorder channels based on their position field
-        match self.reorder_channels_in_category(http, guild_id, category_id, channels).await {
+        match self
+            .reorder_channels_in_category(http, guild_id, category_id, channels)
+            .await
+        {
             Ok(reordered) => {
                 if !reordered.is_empty() {
-                    info!("Reordered {} channels in category '{}'", reordered.len(), category_name);
+                    info!(
+                        "Reordered {} channels in category '{}'",
+                        reordered.len(),
+                        category_name
+                    );
                     summary.channels_reordered = reordered;
                 }
             }
             Err(e) => {
-                warn!("Failed to reorder channels in category '{}': {}", category_name, e);
-                summary.warnings.push(format!("Failed to reorder channels: {}", e));
+                warn!(
+                    "Failed to reorder channels in category '{}': {}",
+                    category_name, e
+                );
+                summary
+                    .warnings
+                    .push(format!("Failed to reorder channels: {}", e));
             }
         }
 
@@ -1040,7 +1088,10 @@ impl ChannelManager {
         });
 
         channel_id
-            .edit(http, serenity::EditChannel::new().permissions(new_overwrites))
+            .edit(
+                http,
+                serenity::EditChannel::new().permissions(new_overwrites),
+            )
             .await?;
 
         Ok(())
