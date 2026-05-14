@@ -15,6 +15,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use super::admin::{admin_router, AdminState};
+use super::api::api_router;
 use super::auth::SharedSessionStore;
 use super::oauth::{DiscordUser, OAuthState, TokenResponse};
 use crate::logging::SharedLogBuffer;
@@ -133,7 +134,7 @@ pub async fn start_web_server(
         .route("/verify/:uuid", get(verify_page))
         .route("/callback", get(oauth_callback))
         .with_state(state)
-        .nest("/admin", admin_router(admin_state));
+        .nest("/admin", admin_router(admin_state.clone()).merge(api_router(admin_state)));
 
     let ports = Ports {
         http: config.http_port,

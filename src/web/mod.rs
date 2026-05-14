@@ -4,6 +4,7 @@
 //! and provide an admin interface for configuration management.
 
 mod admin;
+mod api;
 mod auth;
 mod oauth;
 mod server;
