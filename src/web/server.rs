@@ -492,8 +492,40 @@ async fn oauth_callback(
                     let guild_id = serenity::GuildId::new(guild_id);
                     let member = guild_id.member(&state.serenity_http, user_id).await;
 
-                    if member.is_ok() {
+                    if let Ok(member) = member {
                         // They are in the guild AND verified for this season.
+                        // Use the fresh name from users.json, not the (possibly stale) DB value.
+                        let current_nick = member.nick.as_deref().unwrap_or("");
+                        if current_nick != display_name {
+                            if let Err(e) = guild_id
+                                .edit_member(
+                                    &state.serenity_http,
+                                    user_id,
+                                    serenity::EditMember::new().nickname(&display_name),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to correct nickname for {}: {}",
+                                    user_id, e
+                                );
+                            } else {
+                                info!(
+                                    "Corrected nickname for {} to '{}'",
+                                    user_id, display_name
+                                );
+                            }
+                        }
+                        // Keep DB display_name in sync with users.json in case it changed.
+                        if user.display_name != display_name {
+                            let mut user_db = state.verification_manager.user_db().write().await;
+                            if let Some(existing) = user_db.find_by_discord_id(&discord_user.id) {
+                                let mut updated = existing.clone();
+                                updated.display_name = display_name.clone();
+                                updated.update_last_seen();
+                                user_db.upsert_user(updated);
+                            }
+                        }
                         return Ok(Html(already_verified_page(&discord_user.username)));
                     }
                     // If not in guild, we continue to re-verify (re-add roles, etc)

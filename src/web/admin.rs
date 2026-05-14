@@ -5,6 +5,7 @@
 //! - Managing global settings
 //! - Viewing live logs
 
+use crate::config::{ChannelDefinition, SeasonConfig, SeasonUser};
 use axum::{
     extract::{Path, Query, State},
     http::{header::SET_COOKIE, HeaderMap, StatusCode},
@@ -13,10 +14,11 @@ use axum::{
         Html, IntoResponse, Redirect, Response,
     },
     routing::get,
-    Form, Router,
+    Form, Json, Router,
 };
-use serde::Deserialize;
 use poise::serenity_prelude::{self as serenity, GuildId, UserId};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +33,7 @@ use super::auth::{
 };
 use super::oauth::OAuthState;
 use crate::logging::SharedLogBuffer;
-use crate::managers::{SharedConfigManager, SharedChannelManager, SharedRoleManager};
+use crate::managers::{SharedChannelManager, SharedConfigManager, SharedRoleManager};
 
 /// Extended app state for admin panel
 #[derive(Clone)]
@@ -57,7 +59,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/seasons", get(seasons_list))
         .route("/season/:id", get(season_detail))
         .route("/edit/global", get(edit_global).post(save_global))
-        .route("/edit/season/:id/:file", get(edit_season_file).post(save_season_file))
+        .route(
+            "/edit/season/:id/:file",
+            get(edit_season_file).post(save_season_file),
+        )
         .route("/new-season", get(new_season_form).post(create_season))
         .route("/logs", get(logs_page))
         .route("/logs/stream", get(logs_stream))
@@ -65,17 +70,546 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/sync/roles", axum::routing::post(sync_roles))
         .route("/sync/assignments", axum::routing::post(sync_assignments))
         .route("/sync/season/:id", axum::routing::post(sync_season))
+        .route(
+            "/api/v1/initialize_users",
+            axum::routing::post(api_initialize_users),
+        )
         .with_state(state)
 }
 
+/// Request body for POST /admin/api/v1/initialize_users
+#[derive(Debug, Deserialize)]
+struct InitializeUsersRequest {
+    #[serde(alias = "name")]
+    season_name: String,
+    #[serde(alias = "member_role")]
+    role_name: String,
+    users: Vec<SeasonUser>,
+}
+
+/// JSON error response for API endpoints
+#[derive(Debug, Serialize)]
+struct ApiErrorResponse {
+    error: String,
+    message: String,
+}
+
+/// JSON success response for season upsert/initialization
+#[derive(Debug, Serialize)]
+struct BootstrapSeasonResponse {
+    status: String,
+    season_id: String,
+    source_season_id: String,
+    activated_season_id: String,
+    deactivated_seasons: Vec<String>,
+    sync: Option<ApiSyncSummary>,
+    sync_error: Option<String>,
+}
+
+/// Serializable sync summary for API responses
+#[derive(Debug, Serialize)]
+struct ApiSyncSummary {
+    category_created: Option<String>,
+    category_existing: Option<String>,
+    channels_created: Vec<String>,
+    channels_updated: Vec<String>,
+    channels_reordered: Vec<String>,
+    missing_roles: Vec<String>,
+    warnings: Vec<String>,
+}
+
+impl From<crate::managers::channel_manager::UpdateSummary> for ApiSyncSummary {
+    fn from(summary: crate::managers::channel_manager::UpdateSummary) -> Self {
+        Self {
+            category_created: summary.category_created,
+            category_existing: summary.category_existing,
+            channels_created: summary.channels_created,
+            channels_updated: summary.channels_updated,
+            channels_reordered: summary.channels_reordered,
+            missing_roles: summary.missing_roles,
+            warnings: summary.warnings,
+        }
+    }
+}
+
+/// Validate bearer token for REST API endpoints
+fn require_api_token(headers: &HeaderMap) -> Result<(), (StatusCode, Json<ApiErrorResponse>)> {
+    let expected_token = match std::env::var("ADMIN_API_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => token,
+        _ => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorResponse {
+                    error: "api_token_not_configured".to_string(),
+                    message: "ADMIN_API_TOKEN is not configured".to_string(),
+                }),
+            ));
+        }
+    };
+
+    let provided_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+
+    if provided_token.is_empty() || provided_token != expected_token {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse {
+                error: "unauthorized".to_string(),
+                message: "Missing or invalid bearer token".to_string(),
+            }),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Replace source season member role with target season member role in channel permissions recursively
+fn remap_member_role_in_channels(
+    channels: &[ChannelDefinition],
+    source_member_role: &str,
+    target_member_role: &str,
+) -> Vec<ChannelDefinition> {
+    channels
+        .iter()
+        .cloned()
+        .map(|mut channel| {
+            if source_member_role != target_member_role {
+                if let Some(level) = channel.role_permissions.get(source_member_role).cloned() {
+                    channel.role_permissions.remove(source_member_role);
+                    channel
+                        .role_permissions
+                        .entry(target_member_role.to_string())
+                        .or_insert(level);
+                }
+            }
+
+            channel.children = remap_member_role_in_channels(
+                &channel.children,
+                source_member_role,
+                target_member_role,
+            );
+
+            channel
+        })
+        .collect()
+}
+
+fn validate_season_folder_name(
+    season_id: &str,
+) -> Result<(), (StatusCode, Json<ApiErrorResponse>)> {
+    if season_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_season_id".to_string(),
+                message: "Season name is required".to_string(),
+            }),
+        ));
+    }
+    if season_id == "." || season_id == ".." {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_season_id".to_string(),
+                message: "Season name cannot be '.' or '..'".to_string(),
+            }),
+        ));
+    }
+    if season_id.eq_ignore_ascii_case("template") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_season_id".to_string(),
+                message: "Season name 'template' is reserved".to_string(),
+            }),
+        ));
+    }
+    if season_id.contains('/') || season_id.contains('\\') || season_id.contains('\0') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_season_id".to_string(),
+                message: "Season name cannot contain path separators".to_string(),
+            }),
+        ));
+    }
+    if season_id.chars().any(|c| c.is_control()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_season_id".to_string(),
+                message: "Season name cannot contain control characters".to_string(),
+            }),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn api_upsert_season(
+    state: AdminState,
+    season_id: String,
+    season_name: String,
+    role_name: String,
+    users: Vec<SeasonUser>,
+) -> Result<(StatusCode, Json<BootstrapSeasonResponse>), (StatusCode, Json<ApiErrorResponse>)> {
+    let season_id = season_id.trim().to_string();
+    validate_season_folder_name(&season_id)?;
+
+    let name = season_name.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_name".to_string(),
+                message: "Season name is required".to_string(),
+            }),
+        ));
+    }
+
+    let member_role = role_name.trim().to_string();
+    if member_role.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse {
+                error: "invalid_member_role".to_string(),
+                message: "role_name is required".to_string(),
+            }),
+        ));
+    }
+
+    let (
+        data_path,
+        source_season_id,
+        source_member_role,
+        source_channels,
+        existing_seasons,
+        deactivated_season_ids,
+        season_existed,
+        keep_active_flag,
+    ) = {
+        let config = state.config_manager.read().await;
+        let target_existing = config.get_season(&season_id).cloned();
+
+        let active_seasons: Vec<_> = config
+            .get_seasons()
+            .iter()
+            .filter(|(_, season)| season.is_active())
+            .collect();
+
+        if target_existing.is_none() {
+            if active_seasons.is_empty() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiErrorResponse {
+                        error: "no_active_season".to_string(),
+                        message: "No active season found. Please activate the newest season first."
+                            .to_string(),
+                    }),
+                ));
+            }
+
+            if active_seasons.len() > 1 {
+                let mut active_ids: Vec<String> =
+                    active_seasons.iter().map(|(id, _)| (*id).clone()).collect();
+                active_ids.sort();
+
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiErrorResponse {
+                        error: "multiple_active_seasons".to_string(),
+                        message: format!(
+                            "Multiple active seasons detected: {}. Please deactivate the non-newest season(s) and keep exactly one active season before retrying.",
+                            active_ids.join(", ")
+                        ),
+                    }),
+                ));
+            }
+        }
+
+        let (source_season_id, source_member_role, source_channels, keep_active_flag) =
+            if let Some(existing) = &target_existing {
+                (
+                    existing.season_id.clone(),
+                    existing.member_role(),
+                    existing.channels().to_vec(),
+                    existing.is_active(),
+                )
+            } else {
+                let (active_id, active_season) = active_seasons[0];
+                (
+                    active_id.to_string(),
+                    active_season.member_role(),
+                    active_season.channels().to_vec(),
+                    true,
+                )
+            };
+
+        let existing_seasons: HashMap<String, SeasonConfig> = config
+            .get_seasons()
+            .iter()
+            .map(|(id, season)| (id.clone(), season.config.clone()))
+            .collect();
+
+        let deactivated_season_ids = if target_existing.is_some() {
+            Vec::new()
+        } else {
+            config
+                .get_seasons()
+                .iter()
+                .filter(|(id, season)| id.as_str() != season_id && season.is_active())
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        (
+            config.get_data_path().to_string(),
+            source_season_id,
+            source_member_role,
+            source_channels,
+            existing_seasons,
+            deactivated_season_ids,
+            target_existing.is_some(),
+            keep_active_flag,
+        )
+    };
+
+    let remapped_channels =
+        remap_member_role_in_channels(&source_channels, &source_member_role, &member_role);
+
+    let new_season_config = SeasonConfig {
+        name: name.clone(),
+        active: if season_existed {
+            keep_active_flag
+        } else {
+            true
+        },
+        member_role: Some(member_role.to_string()),
+        channels: remapped_channels.clone(),
+    };
+
+    let season_dir = format!("{}/seasons/{}", data_path, season_id);
+    if let Err(e) = tokio::fs::create_dir_all(&season_dir).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorResponse {
+                error: "create_directory_failed".to_string(),
+                message: format!("Failed to create season directory: {}", e),
+            }),
+        ));
+    }
+
+    let season_json_path = format!("{}/season.json", season_dir);
+    let users_json_path = format!("{}/users.json", season_dir);
+
+    let season_json_bytes = match serde_json::to_vec_pretty(&new_season_config) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: "serialize_failed".to_string(),
+                    message: format!("Failed to serialize season config: {}", e),
+                }),
+            ));
+        }
+    };
+
+    let users_json_bytes = match serde_json::to_vec_pretty(&users) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: "serialize_failed".to_string(),
+                    message: format!("Failed to serialize users: {}", e),
+                }),
+            ));
+        }
+    };
+
+    if let Err(e) = tokio::fs::write(&season_json_path, &season_json_bytes).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorResponse {
+                error: "write_failed".to_string(),
+                message: format!("Failed to write season.json: {}", e),
+            }),
+        ));
+    }
+
+    if let Err(e) = tokio::fs::write(&users_json_path, &users_json_bytes).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorResponse {
+                error: "write_failed".to_string(),
+                message: format!("Failed to write users.json: {}", e),
+            }),
+        ));
+    }
+
+    if !season_existed {
+        // New season: deactivate other active seasons to keep exactly one active season.
+        for (existing_id, mut cfg) in existing_seasons {
+            if existing_id == season_id || !cfg.active {
+                continue;
+            }
+            cfg.active = false;
+            let path = format!("{}/seasons/{}/season.json", data_path, existing_id);
+            let content = match serde_json::to_vec_pretty(&cfg) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiErrorResponse {
+                            error: "serialize_failed".to_string(),
+                            message: format!(
+                                "Failed to serialize deactivated season '{}': {}",
+                                existing_id, e
+                            ),
+                        }),
+                    ));
+                }
+            };
+
+            if let Err(e) = tokio::fs::write(&path, content).await {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorResponse {
+                        error: "write_failed".to_string(),
+                        message: format!(
+                            "Failed to write deactivated season config '{}': {}",
+                            existing_id, e
+                        ),
+                    }),
+                ));
+            }
+        }
+    }
+
+    {
+        let mut config = state.config_manager.write().await;
+        if let Err(e) = config.load_all().await {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorResponse {
+                    error: "reload_failed".to_string(),
+                    message: format!("Failed to reload configuration: {}", e),
+                }),
+            ));
+        }
+    }
+
+    let http = state.serenity_http.as_ref();
+    let guild_id = state.guild_id;
+
+    // Ensure the season member role exists in Discord before syncing channels.
+    // Without this, get_role_id fails silently and channel permissions are skipped.
+    // Pattern mirrors sync_roles handler in this file.
+    match guild_id.roles(http).await {
+        Ok(existing_roles) => {
+            if existing_roles.values().any(|r| r.name == member_role) {
+                info!("Discord role '{}' already exists", member_role);
+            } else {
+                match guild_id
+                    .create_role(
+                        http,
+                        serenity::EditRole::new()
+                            .name(&member_role)
+                            .mentionable(true),
+                    )
+                    .await
+                {
+                    Ok(role) => info!(
+                        "Created Discord role '{}' (ID: {}) for season '{}'",
+                        member_role, role.id, season_id
+                    ),
+                    Err(e) => warn!(
+                        "Failed to create Discord role '{}' for season '{}': {}",
+                        member_role, season_id, e
+                    ),
+                }
+            }
+        }
+        Err(e) => warn!(
+            "Failed to fetch Discord roles while preparing season '{}': {}",
+            season_id, e
+        ),
+    }
+
+    let channel_manager = state.channel_manager.read().await;
+    let sync_result = channel_manager
+        .sync_season_channels(http, guild_id, &name, &remapped_channels)
+        .await;
+    drop(channel_manager);
+
+    let (status, sync, sync_error) = match sync_result {
+        Ok(summary) => {
+            let response_sync = ApiSyncSummary::from(summary);
+            let has_warnings =
+                !response_sync.warnings.is_empty() || !response_sync.missing_roles.is_empty();
+            let status = if has_warnings {
+                "partial_success"
+            } else {
+                "ok"
+            };
+            (status.to_string(), Some(response_sync), None)
+        }
+        Err(e) => (
+            "partial_success".to_string(),
+            None,
+            Some(format!("Season upserted, but sync failed: {}", e)),
+        ),
+    };
+
+    info!(
+        "Season '{}' upserted from '{}' via REST API",
+        season_id, source_season_id
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(BootstrapSeasonResponse {
+            status,
+            season_id: season_id.clone(),
+            source_season_id,
+            activated_season_id: season_id,
+            deactivated_seasons: deactivated_season_ids,
+            sync,
+            sync_error,
+        }),
+    ))
+}
+
+/// POST /admin/api/v1/initialize_users
+///
+/// Uses season_name as folder name and upserts users for that season.
+async fn api_initialize_users(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+    Json(payload): Json<InitializeUsersRequest>,
+) -> Result<(StatusCode, Json<BootstrapSeasonResponse>), (StatusCode, Json<ApiErrorResponse>)> {
+    require_api_token(&headers)?;
+
+    let season_name = payload.season_name;
+    api_upsert_season(
+        state,
+        season_name.clone(),
+        season_name,
+        payload.role_name,
+        payload.users,
+    )
+    .await
+}
+
 /// Check authentication and return session or redirect
-async fn require_auth(
-    headers: &HeaderMap,
-    state: &AdminState,
-) -> Result<AdminSession, Response> {
-    let token = get_session_token(headers).ok_or_else(|| {
-        Redirect::to("/admin/login").into_response()
-    })?;
+async fn require_auth(headers: &HeaderMap, state: &AdminState) -> Result<AdminSession, Response> {
+    let token =
+        get_session_token(headers).ok_or_else(|| Redirect::to("/admin/login").into_response())?;
 
     state
         .session_store
@@ -91,10 +625,7 @@ async fn login(State(state): State<AdminState>) -> Html<String> {
 }
 
 /// GET /admin/logout - Clear session and redirect to login
-async fn logout(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn logout(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     if let Some(token) = get_session_token(&headers) {
         state.session_store.remove_session(&token).await;
     }
@@ -216,12 +747,15 @@ async fn oauth_callback(
         .unwrap_or("Unknown")
         .to_string();
 
-    let avatar_url = user_response.get("avatar").and_then(|v| v.as_str()).map(|hash| {
-        format!(
-            "https://cdn.discordapp.com/avatars/{}/{}.png",
-            discord_id, hash
-        )
-    });
+    let avatar_url = user_response
+        .get("avatar")
+        .and_then(|v| v.as_str())
+        .map(|hash| {
+            format!(
+                "https://cdn.discordapp.com/avatars/{}/{}.png",
+                discord_id, hash
+            )
+        });
 
     // Check if user has admin permissions (including special roles from assignments.json)
     let user_id = UserId::new(discord_id.parse().unwrap_or(0));
@@ -230,7 +764,8 @@ async fn oauth_callback(
         state.guild_id,
         user_id,
         Some(&state.config_manager),
-    ).await;
+    )
+    .await;
 
     if !is_admin {
         warn!(
@@ -254,10 +789,7 @@ async fn oauth_callback(
 }
 
 /// GET /admin - Dashboard
-async fn dashboard(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn dashboard(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     let session = match require_auth(&headers, &state).await {
         Ok(s) => s,
         Err(redirect) => return redirect,
@@ -285,7 +817,10 @@ async fn dashboard(
     drop(user_db);
 
     // Get global config status
-    let roles_count = config.get_global_roles().map(|r| r.roles.len()).unwrap_or(0);
+    let roles_count = config
+        .get_global_roles()
+        .map(|r| r.roles.len())
+        .unwrap_or(0);
     let has_permissions = config.get_global_permissions().is_some();
 
     let html = format!(
@@ -435,7 +970,11 @@ async fn dashboard(
         session.username,
         config.get_seasons().len(),
         roles_count,
-        if has_permissions { "Loaded" } else { "Not loaded" },
+        if has_permissions {
+            "Loaded"
+        } else {
+            "Not loaded"
+        },
         seasons.join("\n")
     );
 
@@ -443,10 +982,7 @@ async fn dashboard(
 }
 
 /// GET /admin/seasons - List all seasons
-async fn seasons_list(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn seasons_list(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     let _session = match require_auth(&headers, &state).await {
         Ok(s) => s,
         Err(redirect) => return redirect,
@@ -636,7 +1172,11 @@ async fn season_detail(
 </html>"#,
         season_id,
         season_id,
-        if season.name().is_empty() { &season_id } else { season.name() },
+        if season.name().is_empty() {
+            &season_id
+        } else {
+            season.name()
+        },
         season.user_count(),
         season.is_active(),
         season_id, // edit users link
@@ -649,10 +1189,7 @@ async fn season_detail(
 }
 
 /// GET /admin/logs - Log viewer page
-async fn logs_page(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn logs_page(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     let _session = match require_auth(&headers, &state).await {
         Ok(s) => s,
         Err(redirect) => return redirect,
@@ -865,10 +1402,7 @@ async fn logs_page(
 }
 
 /// GET /admin/logs/stream - SSE endpoint for live logs
-async fn logs_stream(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn logs_stream(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     // Check auth via query param or cookie
     let token = get_session_token(&headers);
 
@@ -876,7 +1410,10 @@ async fn logs_stream(
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
-    let session = state.session_store.get_session(token.as_ref().unwrap()).await;
+    let session = state
+        .session_store
+        .get_session(token.as_ref().unwrap())
+        .await;
     if session.is_none() {
         return (StatusCode::UNAUTHORIZED, "Session expired").into_response();
     }
@@ -1055,26 +1592,35 @@ async fn edit_global(
     let roles_content = tokio::fs::read_to_string(format!("{}/global/roles.json", data_path))
         .await
         .unwrap_or_else(|_| r#"{"roles": []}"#.to_string());
-    let assignments_content = tokio::fs::read_to_string(format!("{}/global/assignments.json", data_path))
-        .await
-        .unwrap_or_else(|_| r#"{"discord_usernames_by_role": {}}"#.to_string());
-    let permissions_content = tokio::fs::read_to_string(format!("{}/global/permissions.json", data_path))
-        .await
-        .unwrap_or_else(|_| r#"{"definitions": {}}"#.to_string());
+    let assignments_content =
+        tokio::fs::read_to_string(format!("{}/global/assignments.json", data_path))
+            .await
+            .unwrap_or_else(|_| r#"{"discord_usernames_by_role": {}}"#.to_string());
+    let permissions_content =
+        tokio::fs::read_to_string(format!("{}/global/permissions.json", data_path))
+            .await
+            .unwrap_or_else(|_| r#"{"definitions": {}}"#.to_string());
 
     // Get which tab to show
     let active_tab = params.get("tab").map(|s| s.as_str()).unwrap_or("roles");
 
-    let message = params.get("msg").map(|m| {
-        let (class, text) = if m == "saved" {
-            ("success", "Configuration saved successfully!")
-        } else if m.starts_with("error:") {
-            ("error", m.strip_prefix("error:").unwrap_or("Unknown error"))
-        } else {
-            ("", m.as_str())
-        };
-        format!(r#"<div class="message {}">{}</div>"#, class, html_escape(text))
-    }).unwrap_or_default();
+    let message = params
+        .get("msg")
+        .map(|m| {
+            let (class, text) = if m == "saved" {
+                ("success", "Configuration saved successfully!")
+            } else if m.starts_with("error:") {
+                ("error", m.strip_prefix("error:").unwrap_or("Unknown error"))
+            } else {
+                ("", m.as_str())
+            };
+            format!(
+                r#"<div class="message {}">{}</div>"#,
+                class,
+                html_escape(text)
+            )
+        })
+        .unwrap_or_default();
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1202,8 +1748,16 @@ async fn edit_global(
         editor_css = editor_css(),
         message = message,
         roles_active = if active_tab == "roles" { "active" } else { "" },
-        assignments_active = if active_tab == "assignments" { "active" } else { "" },
-        permissions_active = if active_tab == "permissions" { "active" } else { "" },
+        assignments_active = if active_tab == "assignments" {
+            "active"
+        } else {
+            ""
+        },
+        permissions_active = if active_tab == "permissions" {
+            "active"
+        } else {
+            ""
+        },
         roles_content = html_escape(&roles_content),
         assignments_content = html_escape(&assignments_content),
         permissions_content = html_escape(&permissions_content),
@@ -1235,7 +1789,12 @@ async fn save_global(
     // Validate JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&form.content) {
         let err_msg = format!("error:Invalid JSON: {}", e);
-        return Redirect::to(&format!("/admin/edit/global?tab={}&msg={}", file_type, urlencoding::encode(&err_msg))).into_response();
+        return Redirect::to(&format!(
+            "/admin/edit/global?tab={}&msg={}",
+            file_type,
+            urlencoding::encode(&err_msg)
+        ))
+        .into_response();
     }
 
     // Save to file
@@ -1249,7 +1808,11 @@ async fn save_global(
         "permissions" => format!("{}/global/permissions.json", data_path),
         _ => {
             let err_msg = "error:Unknown file type";
-            return Redirect::to(&format!("/admin/edit/global?msg={}", urlencoding::encode(err_msg))).into_response();
+            return Redirect::to(&format!(
+                "/admin/edit/global?msg={}",
+                urlencoding::encode(err_msg)
+            ))
+            .into_response();
         }
     };
 
@@ -1266,7 +1829,12 @@ async fn save_global(
             let mut file = file;
             if let Err(e) = file.write_all(form.content.as_bytes()).await {
                 let err_msg = format!("error:Failed to write: {}", e);
-                return Redirect::to(&format!("/admin/edit/global?tab={}&msg={}", file_type, urlencoding::encode(&err_msg))).into_response();
+                return Redirect::to(&format!(
+                    "/admin/edit/global?tab={}&msg={}",
+                    file_type,
+                    urlencoding::encode(&err_msg)
+                ))
+                .into_response();
             }
             // Sync to disk to prevent race condition with reload
             if let Err(e) = file.sync_all().await {
@@ -1275,7 +1843,12 @@ async fn save_global(
         }
         Err(e) => {
             let err_msg = format!("error:Failed to save: {}", e);
-            return Redirect::to(&format!("/admin/edit/global?tab={}&msg={}", file_type, urlencoding::encode(&err_msg))).into_response();
+            return Redirect::to(&format!(
+                "/admin/edit/global?tab={}&msg={}",
+                file_type,
+                urlencoding::encode(&err_msg)
+            ))
+            .into_response();
         }
     }
 
@@ -1323,11 +1896,15 @@ async fn edit_season_file(
                 <a href="/admin/season/{}" style="color:#5865F2;">Back to season</a>
                 </body></html>"#,
                 params.file, params.id
-            )).into_response();
+            ))
+            .into_response();
         }
     };
 
-    let file_path = format!("{}/seasons/{}/{}", data_path, params.id, file_type.file_name);
+    let file_path = format!(
+        "{}/seasons/{}/{}",
+        data_path, params.id, file_type.file_name
+    );
     let config_type = file_type.name;
     let description = file_type.description;
 
@@ -1336,16 +1913,23 @@ async fn edit_season_file(
         .await
         .unwrap_or_else(|_| get_season_file_template(config_type, &params.id));
 
-    let message = query.get("msg").map(|m| {
-        let (class, text) = if m == "saved" {
-            ("success", "Configuration saved successfully!")
-        } else if m.starts_with("error:") {
-            ("error", m.strip_prefix("error:").unwrap_or("Unknown error"))
-        } else {
-            ("", m.as_str())
-        };
-        format!(r#"<div class="message {}">{}</div>"#, class, html_escape(text))
-    }).unwrap_or_default();
+    let message = query
+        .get("msg")
+        .map(|m| {
+            let (class, text) = if m == "saved" {
+                ("success", "Configuration saved successfully!")
+            } else if m.starts_with("error:") {
+                ("error", m.strip_prefix("error:").unwrap_or("Unknown error"))
+            } else {
+                ("", m.as_str())
+            };
+            format!(
+                r#"<div class="message {}">{}</div>"#,
+                class,
+                html_escape(text)
+            )
+        })
+        .unwrap_or_default();
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1387,12 +1971,16 @@ async fn edit_season_file(
     </script>
 </body>
 </html>"#,
-        config_type, params.id,
+        config_type,
+        params.id,
         editor_css(),
-        params.id, params.id,
-        config_type, params.id,
+        params.id,
+        params.id,
+        config_type,
+        params.id,
         message,
-        params.id, config_type,
+        params.id,
+        config_type,
         html_escape(&content),
         params.id,
         description
@@ -1418,7 +2006,12 @@ async fn save_season_file(
     // Validate JSON
     if let Err(e) = serde_json::from_str::<serde_json::Value>(&form.content) {
         let err_msg = format!("error:Invalid JSON: {}", e);
-        return Redirect::to(&format!("{}?msg={}", redirect_url, urlencoding::encode(&err_msg))).into_response();
+        return Redirect::to(&format!(
+            "{}?msg={}",
+            redirect_url,
+            urlencoding::encode(&err_msg)
+        ))
+        .into_response();
     }
 
     let config = state.config_manager.read().await;
@@ -1429,7 +2022,12 @@ async fn save_season_file(
     let file_type = match get_season_file_type(&params.file) {
         Some(ft) => ft,
         None => {
-            return Redirect::to(&format!("{}?msg={}", redirect_url, urlencoding::encode("error:Unknown file type"))).into_response();
+            return Redirect::to(&format!(
+                "{}?msg={}",
+                redirect_url,
+                urlencoding::encode("error:Unknown file type")
+            ))
+            .into_response();
         }
     };
 
@@ -1439,7 +2037,12 @@ async fn save_season_file(
     // Ensure directory exists
     if let Err(e) = tokio::fs::create_dir_all(&dir_path).await {
         let err_msg = format!("error:Failed to create directory: {}", e);
-        return Redirect::to(&format!("{}?msg={}", redirect_url, urlencoding::encode(&err_msg))).into_response();
+        return Redirect::to(&format!(
+            "{}?msg={}",
+            redirect_url,
+            urlencoding::encode(&err_msg)
+        ))
+        .into_response();
     }
 
     // Save file with explicit sync to ensure data is flushed to disk
@@ -1449,7 +2052,12 @@ async fn save_season_file(
             let mut file = file;
             if let Err(e) = file.write_all(form.content.as_bytes()).await {
                 let err_msg = format!("error:Failed to write: {}", e);
-                return Redirect::to(&format!("{}?msg={}", redirect_url, urlencoding::encode(&err_msg))).into_response();
+                return Redirect::to(&format!(
+                    "{}?msg={}",
+                    redirect_url,
+                    urlencoding::encode(&err_msg)
+                ))
+                .into_response();
             }
             // Sync to disk to prevent race condition with reload
             if let Err(e) = file.sync_all().await {
@@ -1458,7 +2066,12 @@ async fn save_season_file(
         }
         Err(e) => {
             let err_msg = format!("error:Failed to save: {}", e);
-            return Redirect::to(&format!("{}?msg={}", redirect_url, urlencoding::encode(&err_msg))).into_response();
+            return Redirect::to(&format!(
+                "{}?msg={}",
+                redirect_url,
+                urlencoding::encode(&err_msg)
+            ))
+            .into_response();
         }
     }
 
@@ -1468,7 +2081,10 @@ async fn save_season_file(
         warn!("Failed to reload config after save: {}", e);
     }
 
-    info!("Season {} {} saved via admin panel", params.id, file_type.file_name);
+    info!(
+        "Season {} {} saved via admin panel",
+        params.id, file_type.file_name
+    );
     Redirect::to(&format!("{}?msg=saved", redirect_url)).into_response()
 }
 
@@ -1483,16 +2099,23 @@ async fn new_season_form(
         Err(redirect) => return redirect,
     };
 
-    let message = params.get("msg").map(|m| {
-        let (class, text) = if m == "created" {
-            ("success", "Season created successfully!")
-        } else if m.starts_with("error:") {
-            ("error", m.strip_prefix("error:").unwrap_or("Unknown error"))
-        } else {
-            ("", m.as_str())
-        };
-        format!(r#"<div class="message {}">{}</div>"#, class, html_escape(text))
-    }).unwrap_or_default();
+    let message = params
+        .get("msg")
+        .map(|m| {
+            let (class, text) = if m == "created" {
+                ("success", "Season created successfully!")
+            } else if m.starts_with("error:") {
+                ("error", m.strip_prefix("error:").unwrap_or("Unknown error"))
+            } else {
+                ("", m.as_str())
+            };
+            format!(
+                r#"<div class="message {}">{}</div>"#,
+                class,
+                html_escape(text)
+            )
+        })
+        .unwrap_or_default();
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1556,7 +2179,10 @@ async fn create_season(
         return Redirect::to(&format!("/admin/new-season?msg={}", msg)).into_response();
     }
 
-    if !season_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+    if !season_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
         let msg = urlencoding::encode("error:Season ID must be alphanumeric (with _ or -)");
         return Redirect::to(&format!("/admin/new-season?msg={}", msg)).into_response();
     }
@@ -1572,7 +2198,11 @@ async fn create_season(
 
     // Check if season already exists
     if config.get_seasons().contains_key(season_id) {
-        return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode("error:Season already exists"))).into_response();
+        return Redirect::to(&format!(
+            "/admin/new-season?msg={}",
+            urlencoding::encode("error:Season already exists")
+        ))
+        .into_response();
     }
     drop(config);
 
@@ -1582,7 +2212,11 @@ async fn create_season(
     // Create season directory
     if let Err(e) = tokio::fs::create_dir_all(&season_dir).await {
         let err_msg = format!("error:Failed to create directory: {}", e);
-        return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
+        return Redirect::to(&format!(
+            "/admin/new-season?msg={}",
+            urlencoding::encode(&err_msg)
+        ))
+        .into_response();
     }
 
     // Copy and modify template files
@@ -1619,9 +2253,15 @@ async fn create_season(
                         if let Some(name) = form.name.trim().chars().next() {
                             // Only set if name is non-empty
                             if !form.name.trim().is_empty() {
-                                obj.insert("category_name".to_string(), serde_json::json!(form.name.trim()));
+                                obj.insert(
+                                    "category_name".to_string(),
+                                    serde_json::json!(form.name.trim()),
+                                );
                             } else {
-                                obj.insert("category_name".to_string(), serde_json::json!(season_id));
+                                obj.insert(
+                                    "category_name".to_string(),
+                                    serde_json::json!(season_id),
+                                );
                             }
                             let _ = name; // silence warning
                         }
@@ -1639,7 +2279,11 @@ async fn create_season(
                 let mut file = file;
                 if let Err(e) = file.write_all(modified_content.as_bytes()).await {
                     let err_msg = format!("error:Failed to write {}: {}", filename, e);
-                    return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
+                    return Redirect::to(&format!(
+                        "/admin/new-season?msg={}",
+                        urlencoding::encode(&err_msg)
+                    ))
+                    .into_response();
                 }
                 if let Err(e) = file.sync_all().await {
                     warn!("Failed to sync {} to disk: {}", filename, e);
@@ -1647,7 +2291,11 @@ async fn create_season(
             }
             Err(e) => {
                 let err_msg = format!("error:Failed to create {}: {}", filename, e);
-                return Redirect::to(&format!("/admin/new-season?msg={}", urlencoding::encode(&err_msg))).into_response();
+                return Redirect::to(&format!(
+                    "/admin/new-season?msg={}",
+                    urlencoding::encode(&err_msg)
+                ))
+                .into_response();
             }
         }
     }
@@ -1663,10 +2311,7 @@ async fn create_season(
 }
 
 /// POST /admin/restart - Restart the bot
-async fn restart_bot(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn restart_bot(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     let session = match require_auth(&headers, &state).await {
         Ok(s) => s,
         Err(redirect) => return redirect,
@@ -1747,7 +2392,10 @@ fn handle_role_error(role_name: &str, error: &serenity::Error) -> String {
     let err_str = error.to_string();
 
     if err_str.contains("Missing Permissions") || err_str.contains("50013") {
-        let msg = format!("{}: Role hierarchy issue - move bot's role above '{}' in Discord server settings", role_name, role_name);
+        let msg = format!(
+            "{}: Role hierarchy issue - move bot's role above '{}' in Discord server settings",
+            role_name, role_name
+        );
         error!("{}", msg);
         msg
     } else {
@@ -1758,8 +2406,8 @@ fn handle_role_error(role_name: &str, error: &serenity::Error) -> String {
 
 /// Season file type configuration
 struct SeasonFileType {
-    name: &'static str,        // e.g., "users"
-    file_name: &'static str,   // e.g., "users.json"
+    name: &'static str,      // e.g., "users"
+    file_name: &'static str, // e.g., "users.json"
     description: &'static str,
 }
 
@@ -1794,27 +2442,29 @@ fn get_season_file_type(file_type: &str) -> Option<SeasonFileType> {
 fn get_season_file_template(file_type: &str, season_id: &str) -> String {
     match file_type {
         "users" | "users.json" => "[]".to_string(),
-        "season" | "season.json" => format!(r#"{{
+        "season" | "season.json" => format!(
+            r#"{{
   "name": "{}",
   "active": true,
   "channels": []
-}}"#, season_id),
+}}"#,
+            season_id
+        ),
         "category" | "category.json" => r#"{
   "category_name": "Season Category",
   "channels": []
-}"#.to_string(),
+}"#
+        .to_string(),
         "roles" | "roles.json" => r#"{
   "roles": {}
-}"#.to_string(),
+}"#
+        .to_string(),
         _ => "{}".to_string(),
     }
 }
 
 /// POST /admin/sync/roles - Sync roles to Discord
-async fn sync_roles(
-    headers: HeaderMap,
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn sync_roles(headers: HeaderMap, State(state): State<AdminState>) -> impl IntoResponse {
     // Diagnostic logging - this should always appear
     eprintln!("[SYNC_ROLES] Handler called - starting role sync");
     info!("=== SYNC ROLES STARTED ===");
@@ -1844,7 +2494,8 @@ async fn sync_roles(
                 false,
                 "No global roles configured. Add roles to `data/global/roles.json`.",
                 "/admin",
-            )).into_response();
+            ))
+            .into_response();
         }
     };
     drop(config);
@@ -1867,7 +2518,8 @@ async fn sync_roles(
                 false,
                 &format!("Failed to fetch roles from Discord: {}", e),
                 "/admin",
-            )).into_response();
+            ))
+            .into_response();
         }
     };
 
@@ -1877,7 +2529,9 @@ async fn sync_roles(
     let mut errors = Vec::new();
 
     for role_def in &global_roles.roles {
-        if let Some((role_id, existing_role)) = existing_roles.iter().find(|(_, r)| r.name == role_def.name) {
+        if let Some((role_id, existing_role)) =
+            existing_roles.iter().find(|(_, r)| r.name == role_def.name)
+        {
             let target_color = role_def
                 .color
                 .as_ref()
@@ -1937,7 +2591,10 @@ async fn sync_roles(
                 .await
             {
                 Ok(role) => {
-                    info!("Created role '{}' (ID: {}) via admin panel", role_def.name, role.id);
+                    info!(
+                        "Created role '{}' (ID: {}) via admin panel",
+                        role_def.name, role.id
+                    );
                     created.push(role_def.name.clone());
                 }
                 Err(e) => {
@@ -1950,16 +2607,32 @@ async fn sync_roles(
     // Build result message
     let mut message = String::new();
     if !created.is_empty() {
-        message.push_str(&format!("<p><strong>Created ({}):</strong> {}</p>", created.len(), created.join(", ")));
+        message.push_str(&format!(
+            "<p><strong>Created ({}):</strong> {}</p>",
+            created.len(),
+            created.join(", ")
+        ));
     }
     if !updated.is_empty() {
-        message.push_str(&format!("<p><strong>Updated ({}):</strong> {}</p>", updated.len(), updated.join(", ")));
+        message.push_str(&format!(
+            "<p><strong>Updated ({}):</strong> {}</p>",
+            updated.len(),
+            updated.join(", ")
+        ));
     }
     if !unchanged.is_empty() {
-        message.push_str(&format!("<p><strong>Unchanged ({}):</strong> {}</p>", unchanged.len(), unchanged.join(", ")));
+        message.push_str(&format!(
+            "<p><strong>Unchanged ({}):</strong> {}</p>",
+            unchanged.len(),
+            unchanged.join(", ")
+        ));
     }
     if !errors.is_empty() {
-        message.push_str(&format!("<p style=\"color:#e74c3c;\"><strong>Errors ({}):</strong> {}</p>", errors.len(), errors.join(", ")));
+        message.push_str(&format!(
+            "<p style=\"color:#e74c3c;\"><strong>Errors ({}):</strong> {}</p>",
+            errors.len(),
+            errors.join(", ")
+        ));
     }
     if message.is_empty() {
         message = String::from("<p>No roles to sync.</p>");
@@ -1970,7 +2643,8 @@ async fn sync_roles(
         errors.is_empty(),
         &message,
         "/admin",
-    )).into_response()
+    ))
+    .into_response()
 }
 
 /// POST /admin/sync/assignments - Sync role assignments to all verified Discord members
@@ -2024,13 +2698,17 @@ async fn sync_assignments(
                 false,
                 &format!("Failed to fetch guild members: {}", e),
                 "/admin/edit/global?tab=assignments",
-            )).into_response();
+            ))
+            .into_response();
         }
     };
 
     // Get all managed role names (roles in assignments.json)
     let all_assignment_roles = special_members.get_all_role_names();
-    info!("sync_assignments: managed roles: {:?}", all_assignment_roles);
+    info!(
+        "sync_assignments: managed roles: {:?}",
+        all_assignment_roles
+    );
 
     let role_manager = state.role_manager.read().await;
 
@@ -2056,9 +2734,9 @@ async fn sync_assignments(
 
         // Process ALL members who either have or should have assignment roles
         // This ensures we remove roles from users who were removed from assignments.json
-        let has_any_managed_role = managed_role_ids.values().any(|role_id| {
-            member.roles.contains(role_id)
-        });
+        let has_any_managed_role = managed_role_ids
+            .values()
+            .any(|role_id| member.roles.contains(role_id));
 
         if desired_roles.is_empty() && !has_any_managed_role {
             continue; // Skip users with no special roles and no managed roles
@@ -2067,9 +2745,7 @@ async fn sync_assignments(
         users_processed += 1;
         info!(
             "sync_assignments: processing user '{}' ({}) - desired: {:?}",
-            discord_username,
-            user_id,
-            desired_roles
+            discord_username, user_id, desired_roles
         );
 
         let (added, removed, failed) = role_manager
@@ -2097,13 +2773,20 @@ async fn sync_assignments(
     drop(role_manager);
 
     // Build result message
-    let mut message = format!("<p><strong>Users processed:</strong> {}</p>", users_processed);
+    let mut message = format!(
+        "<p><strong>Users processed:</strong> {}</p>",
+        users_processed
+    );
 
     if !total_added.is_empty() {
         message.push_str(&format!(
             "<p><strong>Roles added ({}):</strong></p><ul>{}</ul>",
             total_added.len(),
-            total_added.iter().map(|r| format!("<li>{}</li>", html_escape(r))).collect::<Vec<_>>().join("")
+            total_added
+                .iter()
+                .map(|r| format!("<li>{}</li>", html_escape(r)))
+                .collect::<Vec<_>>()
+                .join("")
         ));
     }
 
@@ -2111,7 +2794,11 @@ async fn sync_assignments(
         message.push_str(&format!(
             "<p><strong>Roles removed ({}):</strong></p><ul>{}</ul>",
             total_removed.len(),
-            total_removed.iter().map(|r| format!("<li>{}</li>", html_escape(r))).collect::<Vec<_>>().join("")
+            total_removed
+                .iter()
+                .map(|r| format!("<li>{}</li>", html_escape(r)))
+                .collect::<Vec<_>>()
+                .join("")
         ));
     }
 
@@ -2119,11 +2806,19 @@ async fn sync_assignments(
         message.push_str(&format!(
             "<p style=\"color:#e74c3c;\"><strong>Failed ({}):</strong></p><ul>{}</ul>",
             total_failed.len(),
-            total_failed.iter().map(|r| format!("<li>{}</li>", html_escape(r))).collect::<Vec<_>>().join("")
+            total_failed
+                .iter()
+                .map(|r| format!("<li>{}</li>", html_escape(r)))
+                .collect::<Vec<_>>()
+                .join("")
         ));
     }
 
-    if total_added.is_empty() && total_removed.is_empty() && total_failed.is_empty() && users_processed > 0 {
+    if total_added.is_empty()
+        && total_removed.is_empty()
+        && total_failed.is_empty()
+        && users_processed > 0
+    {
         message.push_str("<p>All users already have the correct roles.</p>");
     } else if users_processed == 0 {
         message.push_str("<p>No changes needed.</p>");
@@ -2141,7 +2836,8 @@ async fn sync_assignments(
         total_failed.is_empty(),
         &message,
         "/admin/edit/global?tab=assignments",
-    )).into_response()
+    ))
+    .into_response()
 }
 
 /// POST /admin/sync/season/:id - Sync season category to Discord
@@ -2167,7 +2863,11 @@ async fn sync_season(
     let config = state.config_manager.read().await;
     let season = match config.get_season(&season_id) {
         Some(s) => {
-            info!("sync_season: found season '{}' with {} channels", season_id, s.channels().len());
+            info!(
+                "sync_season: found season '{}' with {} channels",
+                season_id,
+                s.channels().len()
+            );
             s.clone()
         }
         None => {
@@ -2177,7 +2877,8 @@ async fn sync_season(
                 false,
                 &format!("Season '{}' not found.", season_id),
                 &format!("/admin/season/{}", season_id),
-            )).into_response();
+            ))
+            .into_response();
         }
     };
     drop(config);
@@ -2186,9 +2887,13 @@ async fn sync_season(
         return Html(sync_result_page(
             &format!("Sync Season {}", season_id),
             false,
-            &format!("Season '{}' has no channels defined in season.json.", season_id),
+            &format!(
+                "Season '{}' has no channels defined in season.json.",
+                season_id
+            ),
             &format!("/admin/season/{}", season_id),
-        )).into_response();
+        ))
+        .into_response();
     }
 
     let http = state.serenity_http.as_ref();
@@ -2198,7 +2903,10 @@ async fn sync_season(
 
     // Use channel_manager to sync
     let channel_manager = state.channel_manager.read().await;
-    let summary = match channel_manager.sync_season_channels(http, guild_id, &category_name, &channels).await {
+    let summary = match channel_manager
+        .sync_season_channels(http, guild_id, &category_name, &channels)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to sync season '{}': {}", season_id, e);
@@ -2207,7 +2915,8 @@ async fn sync_season(
                 false,
                 &format!("Failed to sync season: {}", e),
                 &format!("/admin/season/{}", season_id),
-            )).into_response();
+            ))
+            .into_response();
         }
     };
     drop(channel_manager);
@@ -2216,28 +2925,47 @@ async fn sync_season(
     let mut message = String::new();
 
     if let Some(cat) = &summary.category_created {
-        message.push_str(&format!("<p><strong>Category created:</strong> {}</p>", cat));
+        message.push_str(&format!(
+            "<p><strong>Category created:</strong> {}</p>",
+            cat
+        ));
     } else if let Some(cat) = &summary.category_existing {
         message.push_str(&format!("<p><strong>Category:</strong> {}</p>", cat));
     }
 
     if !summary.channels_created.is_empty() {
-        message.push_str(&format!("<p><strong>Channels created ({}):</strong> {}</p>",
+        message.push_str(&format!(
+            "<p><strong>Channels created ({}):</strong> {}</p>",
             summary.channels_created.len(),
-            summary.channels_created.iter().map(|c| format!("#{}", c)).collect::<Vec<_>>().join(", ")
+            summary
+                .channels_created
+                .iter()
+                .map(|c| format!("#{}", c))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
     if !summary.channels_updated.is_empty() {
-        message.push_str(&format!("<p><strong>Channels updated ({}):</strong> {}</p>",
+        message.push_str(&format!(
+            "<p><strong>Channels updated ({}):</strong> {}</p>",
             summary.channels_updated.len(),
-            summary.channels_updated.iter().map(|c| format!("#{}", c)).collect::<Vec<_>>().join(", ")
+            summary
+                .channels_updated
+                .iter()
+                .map(|c| format!("#{}", c))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
     let has_missing_roles = !summary.missing_roles.is_empty();
     if has_missing_roles {
-        warn!("Missing roles for season '{}': {}", season_id, summary.missing_roles.join(", "));
+        warn!(
+            "Missing roles for season '{}': {}",
+            season_id,
+            summary.missing_roles.join(", ")
+        );
         message.push_str(&format!(
             "<p style=\"color:#f39c12;\"><strong>Warning:</strong> The following roles were not found and permissions were not set: {}</p>",
             summary.missing_roles.join(", ")
@@ -2257,7 +2985,8 @@ async fn sync_season(
         success,
         &message,
         &format!("/admin/season/{}", season_id),
-    )).into_response()
+    ))
+    .into_response()
 }
 
 /// Generate a sync result page
@@ -2332,11 +3061,6 @@ fn sync_result_page(title: &str, success: bool, message: &str, back_url: &str) -
     </div>
 </body>
 </html>"#,
-        title,
-        status_color,
-        title,
-        status_text,
-        message,
-        back_url
+        title, status_color, title, status_text, message, back_url
     )
 }

@@ -118,6 +118,7 @@ impl ConfigManager {
 
     /// Load seasons from data/seasons/ directories
     async fn load_seasons(&mut self) {
+        self.seasons.clear();
         let seasons_path = format!("{}/seasons", self.data_path);
 
         let Ok(mut entries) = tokio::fs::read_dir(&seasons_path).await else {

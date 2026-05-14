@@ -41,6 +41,9 @@ TLS_CERT_PATH=certs/cert.pem
 TLS_KEY_PATH=certs/key.pem
 HTTPS_PORT=443
 HTTP_PORT=80
+
+# Admin API (required for /admin/api/* endpoints)
+ADMIN_API_TOKEN="set-a-long-random-token"
 ```
 
 ### 3. Discord Bot Setup
@@ -188,6 +191,65 @@ cargo run --release
 # List all users (requires Administrator)
 /list_users
 ```
+
+### Admin API - Initialize Users
+Endpoint:
+```text
+POST /admin/api/v1/initialize_users
+Authorization: Bearer <ADMIN_API_TOKEN>
+Content-Type: application/json
+```
+
+Request body:
+```json
+{
+  "season_name": "2026 Foraar",
+  "role_name": "Medlem2026F",
+  "users": [
+    { "Name": "Alice Example", "DiscordId": "a1b2c3d4-1111-2222-3333-444455556666" },
+    { "Name": "Bob Example", "DiscordId": "b2c3d4e5-7777-8888-9999-000011112222" }
+  ]
+}
+```
+
+Local testing (HTTPS on localhost with non-matching cert):
+```bash
+curl -sS -k -X POST "https://localhost:3000/admin/api/v1/initialize_users" \
+  -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "season_name": "2026 Foraar",
+    "role_name": "Medlem2026F",
+    "users": [
+      { "Name": "Alice Example", "DiscordId": "a1b2c3d4-1111-2222-3333-444455556666" },
+      { "Name": "Bob Example", "DiscordId": "b2c3d4e5-7777-8888-9999-000011112222" }
+    ]
+  }'
+```
+
+Production usage:
+```bash
+curl -sS -X POST "https://your-domain.com/admin/api/v1/initialize_users" \
+  -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "season_name": "2026 Foraar",
+    "role_name": "Medlem2026F",
+    "users": [
+      { "Name": "Alice Example", "DiscordId": "a1b2c3d4-1111-2222-3333-444455556666" },
+      { "Name": "Bob Example", "DiscordId": "b2c3d4e5-7777-8888-9999-000011112222" }
+    ]
+  }'
+```
+
+Notes:
+- `season_name` is used as the folder name under `data/seasons/`.
+- `users` must use `Name` and `DiscordId` keys exactly.
+- Existing seasons are upserted (users.json is overwritten).
+- New seasons are created from the currently active season template and then synced.
+- Common error responses:
+  - `multiple_active_seasons`
+  - `unauthorized`
 
 ## Troubleshooting
 
