@@ -141,6 +141,11 @@ pub async fn start_web_server(
         https: config.https_port,
     };
 
+    // Refresh cert from cPanel before loading (no-op if env vars not set or API unreachable)
+    if let Err(e) = crate::cert_renewal::renew_cert_if_needed(&config.cert_path, &config.key_path).await {
+        warn!("Certificate renewal error: {}", e);
+    }
+
     // Load TLS configuration
     let cert_path = config.cert_path.canonicalize().unwrap_or_else(|_| config.cert_path.clone());
     let key_path = config.key_path.canonicalize().unwrap_or_else(|_| config.key_path.clone());

@@ -1,0 +1,17 @@
+# /etc/systemd/system/eventy.service
+[Unit]
+Description=Eventy Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bin/eventy
+ExecStart=/root/bin/eventy/eventy
+Restart=always
+RestartSec=5
+# Restart weekly so the cert renewal runs on startup picks up fresh certs
+RuntimeMaxSec=7d
+
+[Install]
+WantedBy=multi-user.target

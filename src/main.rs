@@ -21,6 +21,7 @@ struct Args {
     guild_id: Option<u64>,
 }
 
+mod cert_renewal;
 mod commands;
 mod config;
 mod error;
