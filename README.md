@@ -229,7 +229,7 @@ curl -sS -k -X POST "https://localhost:3000/admin/api/v1/initialize_users" \
 
 Production usage:
 ```bash
-curl -sS -X POST "https://your-domain.com/admin/api/v1/initialize_users" \
+curl -sS -X POST "${WEB_BASE_URL}/admin/api/v1/initialize_users" \
   -H "Authorization: Bearer ${ADMIN_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
